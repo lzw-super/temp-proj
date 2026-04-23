@@ -13,4 +13,5 @@ CLAUDE.md
 skyseg.onnx 
 example/room4/ 
 *.mp4 
-*.glb
+*.glb 
+output

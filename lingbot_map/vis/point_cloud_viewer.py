@@ -633,6 +633,29 @@ class PointCloudViewer:
         def _(_) -> None:
             self._export_glb()
 
+        # PLY export controls (aligned point cloud)
+        with self.server.gui.add_folder("Export PLY"):
+            self.ply_output_path = self.server.gui.add_text(
+                "Output Path", initial_value="export.ply"
+            )
+            self.ply_include_color = self.server.gui.add_checkbox(
+                "Include Colors", initial_value=True,
+                hint="Include RGB colors in PLY file.",
+            )
+            self.ply_use_filtering = self.server.gui.add_checkbox(
+                "Apply Filtering", initial_value=True,
+                hint="Apply same filtering as GLB (confidence threshold, downsample, etc.).",
+            )
+            self.ply_export_button = self.server.gui.add_button(
+                "Export PLY",
+                hint="Export world_points as PLY with coordinate alignment (same as GLB).",
+            )
+            self.ply_status = self.server.gui.add_text("Status", initial_value="Ready")
+
+        @self.ply_export_button.on_click
+        def _(_) -> None:
+            self._export_ply()
+
         # Video saving controls
         with self.server.gui.add_folder("Video Saving"):
             self.save_video_button = self.server.gui.add_button("Save Video", disabled=False)
@@ -1046,6 +1069,149 @@ class PointCloudViewer:
         mode_str = f"spheres r={self.glb_sphere_radius_slider.value}" if export_mode == "Spheres" else "points"
         self.glb_status.value = f"Saved: {output_path} ({n_pts:,} {mode_str})"
         print(f"GLB exported to {output_path} ({n_pts:,} {mode_str})")
+
+    def _export_ply(self):
+        """Export world_points as PLY format file with proper coordinate alignment.
+
+        Applies the same coordinate transformation as GLB export:
+        1. Transform to first camera's coordinate frame
+        2. Flip Y and Z axes (OpenGL convention)
+        3. Rotate 180 degrees around Y axis
+
+        If filtering is enabled, also applies:
+        - Confidence threshold filtering
+        - Downsample (same factor as visualization)
+        - Bounding box clipping
+        - Statistical outlier removal (if enabled)
+        """
+        from scipy.spatial.transform import Rotation
+
+        self.ply_status.value = "Collecting points..."
+        print("Exporting PLY...")
+
+        use_filtering = self.ply_use_filtering.value
+
+        # Compute coordinate alignment transformation (same as GLB export)
+        if self.cam_dict is not None and len(self.all_steps) > 0:
+            step0 = self.all_steps[0]
+            R0 = self.cam_dict["R"][step0] if "R" in self.cam_dict else np.eye(3)
+            t0 = self.cam_dict["t"][step0] if "t" in self.cam_dict else np.zeros(3)
+
+            # c2w matrix (camera-to-world)
+            c2w_0 = np.eye(4)
+            c2w_0[:3, :3] = R0
+            c2w_0[:3, 3] = t0
+
+            # OpenGL conversion matrix (flip Y and Z)
+            opengl_conversion = np.eye(4)
+            opengl_conversion[1, 1] = -1
+            opengl_conversion[2, 2] = -1
+
+            # Align rotation (180 deg around Y)
+            align_rotation = np.eye(4)
+            align_rotation[:3, :3] = Rotation.from_euler("y", 180, degrees=True).as_matrix()
+
+            # Combined: w2c (inverse of c2w) @ opengl @ align
+            initial_transform = c2w_0 @ opengl_conversion @ align_rotation
+            print("Applying coordinate alignment transformation...")
+        else:
+            initial_transform = np.eye(4)
+            print("Warning: no camera info, exporting without alignment")
+
+        # Collect all points from each frame
+        all_points = []
+        all_colors = []
+
+        for step in self.all_steps:
+            pc = self.pcs[step]["pc"]  # shape (H, W, 3) - world_points
+            color = self.pcs[step]["color"]  # shape (H, W, 3) - RGB colors
+            conf = self.pcs[step]["conf"]  # shape (H, W) - confidence
+            edge_color = self.pcs[step].get("edge_color", None)
+
+            # Apply filtering (same as GLB) or just basic filtering
+            if use_filtering:
+                pts, cols = self.parse_pc_data(
+                    pc, color, conf, edge_color, set_border_color=False,
+                    downsample_factor=self.downsample_slider.value,
+                )
+            else:
+                # Basic: just flatten and filter zeros
+                pts = pc.reshape(-1, 3)
+                cols = color.reshape(-1, 3)
+                valid_mask = np.any(pts != 0, axis=1)
+                pts = pts[valid_mask]
+                cols = cols[valid_mask]
+
+            if len(pts) > 0:
+                # Apply coordinate transformation
+                pts_aligned = pts @ initial_transform[:3, :3].T + initial_transform[:3, 3]
+                all_points.append(pts_aligned)
+
+                # Convert colors to uint8 if needed
+                if cols.dtype != np.uint8:
+                    cols = (np.clip(cols, 0, 1) * 255).astype(np.uint8)
+                all_colors.append(cols)
+
+        if not all_points:
+            self.ply_status.value = "Error: no points to export"
+            return
+
+        vertices = np.concatenate(all_points, axis=0)
+        colors = np.concatenate(all_colors, axis=0)
+
+        # Write PLY file (binary format for efficiency)
+        output_path = self.ply_output_path.value
+        include_color = self.ply_include_color.value
+
+        try:
+            with open(output_path, 'wb') as f:
+                # Write PLY header
+                header_lines = [
+                    "ply",
+                    "format binary_little_endian 1.0",
+                    f"element vertex {len(vertices)}",
+                    "property float x",
+                    "property float y",
+                    "property float z",
+                ]
+                if include_color:
+                    header_lines.extend([
+                        "property uchar red",
+                        "property uchar green",
+                        "property uchar blue",
+                    ])
+                header_lines.append("end_header")
+
+                header = "\n".join(header_lines) + "\n"
+                f.write(header.encode('ascii'))
+
+                # Write binary vertex data
+                if include_color:
+                    vertex_data = np.zeros(len(vertices), dtype=np.dtype([
+                        ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                        ('red', '<u1'), ('green', '<u1'), ('blue', '<u1')
+                    ]))
+                    vertex_data['x'] = vertices[:, 0]
+                    vertex_data['y'] = vertices[:, 1]
+                    vertex_data['z'] = vertices[:, 2]
+                    vertex_data['red'] = colors[:, 0]
+                    vertex_data['green'] = colors[:, 1]
+                    vertex_data['blue'] = colors[:, 2]
+                    vertex_data.tofile(f)
+                else:
+                    vertices.astype('<f4').tofile(f)
+
+            n_pts = len(vertices)
+            filter_str = "filtered" if use_filtering else "raw"
+            color_str = "with colors" if include_color else "no colors"
+            self.ply_status.value = f"Saved: {output_path} ({n_pts:,} pts, {filter_str}, {color_str})"
+            print(f"PLY exported to {output_path} ({n_pts:,} {filter_str} points, {color_str})")
+
+        except Exception as e:
+            self.ply_status.value = f"Error: {str(e)}"
+            print(f"PLY export error: {e}")
+            import traceback
+            traceback.print_exc()
 
     @staticmethod
     def _build_trajectory_tube(positions, radius, colormap, num_cameras):

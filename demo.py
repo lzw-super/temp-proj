@@ -276,6 +276,20 @@ def main():
                         help="Save sky mask visualizations (original | mask | overlay) to this directory")
     parser.add_argument("--export_preprocessed", type=str, default=None,
                         help="Export stride-sampled, resized/cropped images to this folder")
+    parser.add_argument("--export_ply", type=str, default=None,
+                        help="Export 3D point cloud as PLY file after inference (no viewer needed)")
+    parser.add_argument("--ply_conf_threshold", type=float, default=1.5,
+                        help="Confidence threshold for PLY export (higher = fewer, higher-quality points)")
+    parser.add_argument("--ply_downsample", type=int, default=10,
+                        help="Downsample factor for PLY export (1 = all points, 10 = every 10th point)")
+    parser.add_argument("--ply_raw", action="store_true",
+                        help="Export raw points without filtering (full point cloud, large file)")
+    parser.add_argument("--ply_use_depth", action="store_true", default=True,
+                        help="Use depth-based points (same as viewer). False: use model world_points.")
+    parser.add_argument("--export_depth_pose", type=str, default=None,
+                        help="Export depth and camera poses to specified directory (npy for depth, txt for poses)")
+    parser.add_argument("--no_viewer", action="store_true",
+                        help="Skip launching visualization viewer (useful for batch processing)")
 
     args = parser.parse_args()
     assert args.image_folder or args.video_path, \
@@ -346,7 +360,27 @@ def main():
     # ── Post-process ─────────────────────────────────────────────────────────
     predictions, images_cpu = postprocess(predictions, images)
 
+    # ── Export PLY (if requested) ─────────────────────────────────────────────
+    if args.export_ply:
+        use_filtering = not args.ply_raw
+        print(f"Exporting point cloud to {args.export_ply}...")
+        export_raw_ply(
+            predictions, images_cpu, args.export_ply,
+            conf_threshold=args.ply_conf_threshold if use_filtering else 0,
+            downsample_factor=args.ply_downsample if use_filtering else 1,
+            use_depth=args.ply_use_depth,
+        )
+
+    # ── Export depth and poses (if requested) ─────────────────────────────────
+    if args.export_depth_pose:
+        export_depth_and_pose(predictions, args.export_depth_pose, images_cpu)
+
     # ── Visualize ────────────────────────────────────────────────────────────
+    if args.no_viewer:
+        print("Skipping viewer (--no_viewer mode).")
+        print(f"Predictions contain keys: {list(predictions.keys())}")
+        return
+
     try:
         from lingbot_map.vis import PointCloudViewer
         viewer = PointCloudViewer(
@@ -365,6 +399,340 @@ def main():
     except ImportError:
         print("viser not installed. Install with: pip install lingbot-map[vis]")
         print(f"Predictions contain keys: {list(predictions.keys())}")
+
+
+def export_depth_and_pose(predictions, output_dir, images=None):
+    """Export depth maps and camera poses to files.
+
+    Saves:
+    - depth/: directory containing S npy files, each (H, W) depth map
+    - rgb/: directory containing S jpg files, each (H, W, 3) RGB image (optional)
+    - extrinsic.txt: S lines, each line has 12 numbers (3x4 matrix flattened)
+    - intrinsic.txt: S lines, each line has 9 numbers (3x3 matrix flattened)
+    - depth_conf/: directory containing S npy files, each (H, W) confidence (optional)
+
+    Args:
+        predictions: Dictionary containing 'depth', 'extrinsic', 'intrinsic'
+        output_dir: Directory to save the files
+        images: Optional preprocessed images (S, 3, H, W) or (S, H, W, 3) to save as jpg
+    """
+    import os
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    depth = predictions.get("depth")
+    extrinsic = predictions.get("extrinsic")
+    intrinsic = predictions.get("intrinsic")
+    depth_conf = predictions.get("depth_conf")
+
+    # Check required data
+    if depth is None:
+        print("Error: 'depth' not found in predictions")
+        return
+    if extrinsic is None:
+        print("Error: 'extrinsic' not found in predictions")
+        return
+    if intrinsic is None:
+        print("Error: 'intrinsic' not found in predictions")
+        return
+
+    # Convert to numpy if needed
+    if isinstance(depth, torch.Tensor):
+        depth = depth.numpy()
+    if isinstance(extrinsic, torch.Tensor):
+        extrinsic = extrinsic.numpy()
+    if isinstance(intrinsic, torch.Tensor):
+        intrinsic = intrinsic.numpy()
+    if depth_conf is not None and isinstance(depth_conf, torch.Tensor):
+        depth_conf = depth_conf.numpy()
+    if images is not None and isinstance(images, torch.Tensor):
+        images = images.numpy()
+
+    # Remove last dimension if present (H, W, 1) -> (H, W)
+    if depth.ndim == 4 and depth.shape[-1] == 1:
+        depth = depth.squeeze(-1)
+
+    S = depth.shape[0]
+    H, W = depth.shape[1], depth.shape[2]
+    print(f"Exporting depth and poses for {S} frames to {output_dir}")
+    print(f"  Depth shape per frame: ({H}, {W})")
+
+    # Save depth maps as individual npy files in depth/ subdirectory
+    depth_dir = os.path.join(output_dir, "depth")
+    os.makedirs(depth_dir, exist_ok=True)
+    for i in range(S):
+        depth_path = os.path.join(depth_dir, f"{i:06d}.npy")
+        np.save(depth_path, depth[i])
+    print(f"  Saved depth maps: {depth_dir}/ ({S} files)")
+
+    # Save RGB images as jpg files in rgb/ subdirectory (if provided)
+    if images is not None:
+        # Handle different image formats
+        if images.ndim == 4 and images.shape[1] == 3:
+            # (S, 3, H, W) -> (S, H, W, 3)
+            images = images.transpose(0, 2, 3, 1)
+
+        rgb_dir = os.path.join(output_dir, "rgb")
+        os.makedirs(rgb_dir, exist_ok=True)
+        for i in range(S):
+            img = images[i]
+            # Convert from float [0,1] to uint8 [0,255]
+            if img.dtype != np.uint8:
+                img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+            # Convert RGB to BGR for cv2
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            rgb_path = os.path.join(rgb_dir, f"{i:06d}.jpg")
+            cv2.imwrite(rgb_path, img_bgr)
+        print(f"  Saved RGB images: {rgb_dir}/ ({S} files, shape: ({H}, {W}, 3))")
+
+    # Save depth_conf as individual npy files (if available)
+    if depth_conf is not None:
+        if depth_conf.ndim == 3 and depth_conf.shape[-1] == 1:
+            depth_conf = depth_conf.squeeze(-1)
+        conf_dir = os.path.join(output_dir, "depth_conf")
+        os.makedirs(conf_dir, exist_ok=True)
+        for i in range(S):
+            conf_path = os.path.join(conf_dir, f"{i:06d}.npy")
+            np.save(conf_path, depth_conf[i])
+        print(f"  Saved depth_conf: {conf_dir}/ ({S} files)")
+
+    # Save extrinsic as txt: S lines, each line 12 numbers
+    extrinsic_path = os.path.join(output_dir, "extrinsic.txt")
+    with open(extrinsic_path, 'w') as f:
+        for i in range(S):
+            # Flatten 3x4 to 12 numbers
+            flat = extrinsic[i].reshape(12)
+            f.write(" ".join([f"{v:.6f}" for v in flat]) + "\n")
+    print(f"  Saved extrinsic: {extrinsic_path} ({S} lines, 12 numbers each)")
+
+    # Save intrinsic as txt: S lines, each line 9 numbers
+    intrinsic_path = os.path.join(output_dir, "intrinsic.txt")
+    with open(intrinsic_path, 'w') as f:
+        for i in range(S):
+            # Flatten 3x3 to 9 numbers
+            flat = intrinsic[i].reshape(9)
+            f.write(" ".join([f"{v:.6f}" for v in flat]) + "\n")
+    print(f"  Saved intrinsic: {intrinsic_path} ({S} lines, 9 numbers each)")
+
+    print(f"Depth and pose export complete!")
+
+
+def export_raw_ply(predictions, images, output_path, conf_threshold=1.5, downsample_factor=10, use_depth=True):
+    """Export world_points to PLY format with proper coordinate alignment and filtering.
+
+    Applies the same processing as viewer/GLB export:
+    1. Coordinate alignment (first camera frame, OpenGL convention, 180 deg rotation)
+    2. Confidence threshold filtering (if conf_threshold > 0)
+    3. Downsample (if downsample_factor > 1)
+
+    Args:
+        predictions: Dictionary containing 'world_points', 'extrinsic', 'depth', 'depth_conf', 'intrinsic'
+        images: Image tensor (S, 3, H, W) or (B, S, 3, H, W) - may need squeeze
+        output_path: Path to save the PLY file
+        conf_threshold: Confidence threshold (higher = fewer, higher-quality points). 0 = no filter.
+        downsample_factor: Downsample factor (1 = all points, 10 = every 10th point)
+        use_depth: If True, use depth-based points (same as viewer default).
+                   If False, use model's world_points directly.
+    """
+    from scipy.spatial.transform import Rotation
+    from lingbot_map.utils.geometry import unproject_depth_map_to_point_map
+
+    extrinsics = predictions.get("extrinsic")
+    intrinsics = predictions.get("intrinsic")
+    depth = predictions.get("depth")
+    depth_conf = predictions.get("depth_conf")
+    world_points_direct = predictions.get("world_points")
+    world_points_conf = predictions.get("world_points_conf")
+
+    if extrinsics is None or intrinsics is None:
+        print("Error: 'extrinsic' or 'intrinsic' not found in predictions")
+        return
+
+    # Handle both tensor and numpy array
+    if isinstance(extrinsics, torch.Tensor):
+        extrinsics = extrinsics.numpy()
+    if isinstance(intrinsics, torch.Tensor):
+        intrinsics = intrinsics.numpy()
+    if isinstance(depth, torch.Tensor):
+        depth = depth.numpy()
+    if isinstance(depth_conf, torch.Tensor):
+        depth_conf = depth_conf.numpy()
+    if world_points_direct is not None and isinstance(world_points_direct, torch.Tensor):
+        world_points_direct = world_points_direct.numpy()
+    if world_points_conf is not None and isinstance(world_points_conf, torch.Tensor):
+        world_points_conf = world_points_conf.numpy()
+
+    # Choose point cloud source (same logic as viewer)
+    if use_depth and depth is not None:
+        print("Using depth-based points (same as viewer default)")
+        world_points = unproject_depth_map_to_point_map(depth, extrinsics, intrinsics)  #应用内外参转换成世界坐标  
+        conf = depth_conf
+    else:
+        print("Using model's world_points directly")
+        if world_points_direct is None:
+            print("Error: 'world_points' not found in predictions")
+            return
+        world_points = world_points_direct
+        conf = world_points_conf if world_points_conf is not None else depth_conf
+
+    # Handle images - may need squeeze for batch dimension
+    if isinstance(images, torch.Tensor):
+        images = images.numpy()
+
+    # Debug: print shapes before processing
+    print(f"Before processing:")
+    print(f"  world_points shape: {world_points.shape}")
+    print(f"  images shape: {images.shape}")
+    print(f"  images dtype: {images.dtype}")
+    print(f"  images value range: min={images.min():.4f}, max={images.max():.4f}")
+
+    # Squeeze batch dimension if present (B, S, 3, H, W) -> (S, 3, H, W)
+    if images.ndim == 5 and images.shape[0] == 1:
+        images = images[0]
+        print(f"  Squeezed batch dim, images shape now: {images.shape}")
+
+    # Convert (S, 3, H, W) -> (S, H, W, 3) for color extraction
+    if images.ndim == 4 and images.shape[1] == 3:
+        images = images.transpose(0, 2, 3, 1)
+        print(f"  Transposed to (S, H, W, 3), images shape now: {images.shape}")
+
+    # Final shapes
+    print(f"After processing:")
+    print(f"  world_points shape: {world_points.shape}")
+    print(f"  images shape: {images.shape}")
+
+    # Verify dimensions match
+    S_pts = world_points.shape[0]
+    S_imgs = images.shape[0]
+    if S_pts != S_imgs:
+        print(f"Warning: dimension mismatch - world_points has {S_pts} frames, images has {S_imgs}")
+        # Try to match
+        if S_imgs > S_pts:
+            images = images[:S_pts]
+        elif S_pts > S_imgs:
+            # Can't fix this easily
+            print("Error: insufficient images for all point frames")
+            return
+
+    # Compute coordinate alignment transformation (same as GLB export)
+    extrinsic_0_4x4 = np.eye(4)
+    extrinsic_0_4x4[:3, :4] = extrinsics[0]
+
+    # OpenGL conversion matrix (flip Y and Z)
+    opengl_conversion = np.eye(4)
+    opengl_conversion[1, 1] = -1
+    opengl_conversion[2, 2] = -1
+
+    # Align rotation (180 deg around Y)
+    align_rotation = np.eye(4)
+    align_rotation[:3, :3] = Rotation.from_euler("y", 180, degrees=True).as_matrix()
+
+    initial_transform = np.linalg.inv(extrinsic_0_4x4) @ opengl_conversion @ align_rotation   # 初始变换矩阵（同时包含对应的旋转和平移适配）
+    print("Applying coordinate alignment transformation...")
+
+    # Collect all points across all frames
+    all_points = []
+    all_colors = []
+
+    S = world_points.shape[0]
+    total_raw_pts = 0
+    total_filtered_pts = 0
+
+    for i in range(S):
+        pts = world_points[i].reshape(-1, 3)  # (H*W, 3)
+        cols = images[i].reshape(-1, 3)  # (H*W, 3) after transpose
+        conf_i = conf[i].reshape(-1) if conf is not None else np.ones(len(pts))
+
+        total_raw_pts += len(pts)
+
+        # Build valid mask: non-zero points + finite + confidence threshold
+        valid_mask = np.isfinite(pts).all(axis=1) & np.any(pts != 0, axis=1)
+
+        if conf_threshold > 0:
+            valid_mask = valid_mask & (conf_i > conf_threshold)
+
+        if np.sum(valid_mask) == 0:
+            continue
+
+        pts_valid = pts[valid_mask]
+        cols_valid = cols[valid_mask]
+
+        # Debug: print color info for first frame
+        if i == 0:
+            print(f"Frame 0 color check:")
+            print(f"  cols_valid shape: {cols_valid.shape}")
+            print(f"  cols_valid dtype: {cols_valid.dtype}")
+            print(f"  cols_valid sample values: {cols_valid[:5]}")
+            print(f"  cols_valid min: {cols_valid.min()}, max: {cols_valid.max()}")
+
+        # Apply transformation
+        pts_aligned = pts_valid @ initial_transform[:3, :3].T + initial_transform[:3, 3]
+
+        # Convert colors to uint8 (from [0,1] float range)
+        if cols_valid.dtype != np.uint8:
+            # Check value range before conversion
+            col_min, col_max = cols_valid.min(), cols_valid.max()
+            if col_min < 0 or col_max > 1:
+                print(f"Warning: color values out of [0,1] range: min={col_min:.3f}, max={col_max:.3f}")
+                # Try to normalize if values look like 0-255 range
+                if col_max > 1 and col_max <= 255:
+                    cols_valid = cols_valid / 255.0
+            cols_valid = (np.clip(cols_valid, 0, 1) * 255).astype(np.uint8)
+        all_points.append(pts_aligned)
+        all_colors.append(cols_valid)
+        total_filtered_pts += len(pts_aligned)
+
+    if not all_points:
+        print("Error: no valid points to export")
+        return
+
+    vertices = np.concatenate(all_points, axis=0)
+    colors = np.concatenate(all_colors, axis=0)
+
+    # Debug: check final colors before writing
+    print(f"Final colors check:")
+    print(f"  colors shape: {colors.shape}")
+    print(f"  colors dtype: {colors.dtype}")
+    print(f"  colors sample values: {colors[:5]}")
+    print(f"  colors min: {colors.min()}, max: {colors.max()}")
+
+    # Downsample
+    if downsample_factor > 1:
+        indices = np.arange(0, len(vertices), downsample_factor)
+        vertices = vertices[indices]
+        colors = colors[indices]
+        print(f"Downsampled: {len(vertices)} points (factor={downsample_factor})")
+
+    # Write binary PLY
+    try:
+        with open(output_path, 'wb') as f:
+            # Header
+            header = f"ply\nformat binary_little_endian 1.0\nelement vertex {len(vertices)}\n"
+            header += "property float x\nproperty float y\nproperty float z\n"
+            header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+            header += "end_header\n"
+            f.write(header.encode('ascii'))
+
+            # Binary vertex data
+            vertex_data = np.zeros(len(vertices), dtype=np.dtype([
+                ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                ('red', '<u1'), ('green', '<u1'), ('blue', '<u1')
+            ]))
+            vertex_data['x'] = vertices[:, 0]
+            vertex_data['y'] = vertices[:, 1]
+            vertex_data['z'] = vertices[:, 2]
+            vertex_data['red'] = colors[:, 0]
+            vertex_data['green'] = colors[:, 1]
+            vertex_data['blue'] = colors[:, 2]
+            vertex_data.tofile(f)
+
+        print(f"PLY exported: {output_path}")
+        print(f"  Total raw points: {total_raw_pts:,}")
+        print(f"  After confidence filter: {total_filtered_pts:,}")
+        print(f"  Final exported: {len(vertices):,}")
+
+    except Exception as e:
+        print(f"PLY export error: {e}")
 
 
 if __name__ == "__main__":
