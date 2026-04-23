@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Debug Lingbot-Map demo",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${fileDirname}/demo.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--model_path", "/home/shared_files/model_weights/linbo_map/lingbot-map.pt",
+                "--image_folder", "example/room4/rgb",
+                "--mask_sky",
+                "--use_sdpa"
+            ],
+            "python": "/home/lizhengwu/miniconda3/envs/lingbot-map/bin/python",
+            "cwd": "${fileDirname}",
+            "justMyCode": true
+        }
+    ]
+}

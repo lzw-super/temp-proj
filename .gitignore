@@ -10,4 +10,7 @@ demo_render/
 CLAUDE.md
 .claude/
 .agents/
-skyseg.onnx
+skyseg.onnx 
+example/room4/ 
+*.mp4 
+*.glb
