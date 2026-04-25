@@ -416,7 +416,8 @@ def export_depth_and_pose(predictions, output_dir, images=None):
         output_dir: Directory to save the files
         images: Optional preprocessed images (S, 3, H, W) or (S, H, W, 3) to save as jpg
     """
-    import os
+    import os 
+    from lingbot_map.utils.geometry import closed_form_inverse_se3,closed_form_inverse_se3_general  #取逆 w2c转c2w
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -435,12 +436,12 @@ def export_depth_and_pose(predictions, output_dir, images=None):
     if intrinsic is None:
         print("Error: 'intrinsic' not found in predictions")
         return
-
+    cam_to_world_extrinsic = closed_form_inverse_se3_general(extrinsic)
     # Convert to numpy if needed
     if isinstance(depth, torch.Tensor):
         depth = depth.numpy()
-    if isinstance(extrinsic, torch.Tensor):
-        extrinsic = extrinsic.numpy()
+    if isinstance(cam_to_world_extrinsic, torch.Tensor):
+        cam_to_world_extrinsic = cam_to_world_extrinsic.numpy()
     if isinstance(intrinsic, torch.Tensor):
         intrinsic = intrinsic.numpy()
     if depth_conf is not None and isinstance(depth_conf, torch.Tensor):
@@ -500,10 +501,10 @@ def export_depth_and_pose(predictions, output_dir, images=None):
     extrinsic_path = os.path.join(output_dir, "extrinsic.txt")
     with open(extrinsic_path, 'w') as f:
         for i in range(S):
-            # Flatten 3x4 to 12 numbers
-            flat = extrinsic[i].reshape(12)
-            f.write(" ".join([f"{v:.6f}" for v in flat]) + "\n")
-    print(f"  Saved extrinsic: {extrinsic_path} ({S} lines, 12 numbers each)")
+            # Flatten 4x4 to 16 numbers
+            flat = cam_to_world_extrinsic[i].reshape(16)
+            f.write(" ".join([f"{v:.12f}" for v in flat]) + "\n")
+    print(f"  Saved extrinsic: {extrinsic_path} ({S} lines, 16 numbers each)")
 
     # Save intrinsic as txt: S lines, each line 9 numbers
     intrinsic_path = os.path.join(output_dir, "intrinsic.txt")

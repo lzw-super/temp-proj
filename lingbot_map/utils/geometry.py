@@ -106,7 +106,7 @@ def unproject_depth_map_to_point_map(
     # 结果形状: (S, H, W, 3)
     world_points_array = np.stack(world_points_list, axis=0)
 
-    return world_points_array
+    return world_points_array 
 
 
 def depth_to_world_coords_points(
@@ -240,7 +240,7 @@ def depth_to_world_coords_points(
     #   即 P_new = P_old × R.T，等价于 P_new = R × P_old (点作为列向量)
     world_coords_points = np.dot(cam_coords_points, R_cam_to_world.T) + t_cam_to_world
 
-    return world_coords_points, cam_coords_points, point_mask
+    return world_coords_points, cam_coords_points, point_mask 
 
 
 def depth_to_cam_coords_points(depth_map: np.ndarray, intrinsic: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
