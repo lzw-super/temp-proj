@@ -14,4 +14,5 @@ skyseg.onnx
 example/room4/ 
 *.mp4 
 *.glb 
-output
+output 
+example/office2_static1

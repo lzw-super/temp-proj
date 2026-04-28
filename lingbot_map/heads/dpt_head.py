@@ -94,7 +94,7 @@ class DPTHead(nn.Module):
         self.scratch.refinenet2 = _make_fusion_block(features)
         self.scratch.refinenet3 = _make_fusion_block(features)
         self.scratch.refinenet4 = _make_fusion_block(features, has_residual=False)
-
+ 
         head_features_1 = features
         head_features_2 = 32
 

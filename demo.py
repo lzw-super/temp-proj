@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import glob
+import logging
 import os
 import time
 
@@ -27,6 +28,16 @@ import cv2
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+
+# Configure logging to show INFO level messages both in terminal and log file
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Output to terminal
+        logging.FileHandler('demo.log', mode='w'),  # Output to log file
+    ]
+)
 
 from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
 from lingbot_map.utils.geometry import closed_form_inverse_se3_general
@@ -38,8 +49,14 @@ from lingbot_map.utils.load_fn import load_and_preprocess_images
 # =============================================================================
 
 def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png",
-                first_k=None, stride=1, image_size=518, patch_size=14, num_workers=8):
+                first_k=None, stride=1, image_size=518, patch_size=14, num_workers=8,
+                test_resolution=None):
     """Load images from folder or video and preprocess into a tensor.
+
+    Args:
+        test_resolution: Optional test resolution override ("240p", "360p", "480p").
+                         If set, images are resized to this resolution instead of
+                         the default crop/pad preprocessing.
 
     Returns:
         (images, paths, resolved_image_folder): preprocessed tensor, file paths,
@@ -89,9 +106,13 @@ def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png
         mode="crop",
         image_size=image_size,
         patch_size=patch_size,
+        test_resolution=test_resolution,
     )
     h, w = images.shape[-2:]
-    print(f"Preprocessed images to {w}x{h} using canonical crop mode")
+    if test_resolution is not None:
+        print(f"Preprocessed images to {w}x{h} (test resolution: {test_resolution})")
+    else:
+        print(f"Preprocessed images to {w}x{h} using canonical crop mode")
     return images, paths, resolved_folder
 
 
@@ -108,7 +129,7 @@ def load_model(args, device):
 
     print("Building model...")
     model = GCTStream(
-        img_size=args.image_size,
+        img_size=518,  #固定的值
         patch_size=args.patch_size,
         enable_3d_rope=args.enable_3d_rope,
         max_frame_num=args.max_frame_num,
@@ -258,6 +279,8 @@ def main():
     parser.add_argument("--kv_cache_scale_frames", type=int, default=8)
     parser.add_argument("--use_sdpa", action="store_true", default=False,
                         help="Use SDPA backend (no flashinfer needed). Default: FlashInfer")
+    parser.add_argument("--test_resolution", type=str, default=None, choices=["240p", "360p", "480p"],
+                        help="Test processing time with specified input resolution (240p=308x238, 360p=476x350, 480p=630x476)")
 
     # Windowed options
     parser.add_argument("--window_size", type=int, default=64, help="Frames per window (windowed mode)")
@@ -291,6 +314,26 @@ def main():
     parser.add_argument("--no_viewer", action="store_true",
                         help="Skip launching visualization viewer (useful for batch processing)")
 
+    # Video saving options
+    parser.add_argument("--save_video", type=str, default=None,
+                        help="Save videos to specified path (e.g., output). "
+                             "Generates: output_pointcloud.mp4 (point cloud animation) "
+                             "and output_original.mp4 (original images). "
+                             "In --no_viewer mode: always saves both videos. "
+                             "In viewer mode: saves original only, unless --save_pointcloud_video is set.")
+    parser.add_argument("--video_fps", type=int, default=10,
+                        help="Video frame rate (default: 10)")
+    parser.add_argument("--video_resolution", type=str, default="1920x1080",
+                        choices=["1280x720", "1920x1080", "3840x2160"],
+                        help="Video resolution (default: 1920x1080)")
+    parser.add_argument("--save_pointcloud_video", action="store_true", default=False,
+                        help="Force save point cloud video even in viewer mode "
+                             "(uses Open3D offline rendering, GPU accelerated)")
+    parser.add_argument("--video_mode", type=str, default="accumulate",
+                        choices=["accumulate", "single"],
+                        help="Point cloud video mode: 'accumulate' shows all frames up to current "
+                             "(3D mode), 'single' shows only current frame (4D mode)")
+
     args = parser.parse_args()
     assert args.image_folder or args.video_path, \
         "Provide --image_folder or --video_path"
@@ -303,6 +346,7 @@ def main():
         image_folder=args.image_folder, video_path=args.video_path,
         fps=args.fps, first_k=args.first_k, stride=args.stride,
         image_size=args.image_size, patch_size=args.patch_size,
+        test_resolution=args.test_resolution,
     )
 
     # Export preprocessed images if requested
@@ -360,6 +404,39 @@ def main():
     # ── Post-process ─────────────────────────────────────────────────────────
     predictions, images_cpu = postprocess(predictions, images)
 
+    # ── Export test RGB images (if test_resolution is set) ───────────────────────
+    if args.test_resolution is not None:
+        test_output_dir = os.path.join(os.path.dirname(args.image_folder) if args.image_folder else '.', 'test')
+        os.makedirs(test_output_dir, exist_ok=True)
+        print(f"Exporting test RGB images to {test_output_dir}/ (resolution: {args.test_resolution})")
+
+        # images_cpu already contains resized images (test_resolution applied in load_and_preprocess_images)
+        if isinstance(images_cpu, torch.Tensor):
+            images_np = images_cpu.cpu().numpy()
+        else:
+            images_np = images_cpu
+
+        # Remove batch dimension if present
+        if images_np.ndim == 5 and images_np.shape[0] == 1:
+            images_np = images_np[0]
+
+        S = images_np.shape[0]
+        # Convert (S, 3, H, W) -> (S, H, W, 3)
+        if images_np.ndim == 4 and images_np.shape[1] == 3:
+            images_np = images_np.transpose(0, 2, 3, 1)
+
+        H, W = images_np.shape[1], images_np.shape[2]
+        for i in range(S):
+            img = images_np[i]
+            # Convert from float [0,1] to uint8 [0,255]
+            if img.dtype != np.uint8:
+                img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+            # Convert RGB to BGR for cv2
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            img_path = os.path.join(test_output_dir, f"{i:06d}.jpg")
+            cv2.imwrite(img_path, img_bgr)
+        print(f"  Saved {S} RGB images ({W}x{H}) to {test_output_dir}/")
+
     # ── Export PLY (if requested) ─────────────────────────────────────────────
     if args.export_ply:
         use_filtering = not args.ply_raw
@@ -375,12 +452,70 @@ def main():
     if args.export_depth_pose:
         export_depth_and_pose(predictions, args.export_depth_pose, images_cpu)
 
-    # ── Visualize ────────────────────────────────────────────────────────────
+    # ── Save video (if requested) ───────────────────────────────────────────────
+    if args.save_video:
+        # Generate video paths
+        video_base_path = args.save_video
+        if not video_base_path.endswith('.mp4'):
+            video_base_path = video_base_path + '.mp4'
+
+        # Extract base name for related videos
+        base_name = os.path.splitext(video_base_path)[0]
+        pointcloud_video_path = f"{base_name}_pointcloud.mp4"
+        original_video_path = f"{base_name}_original.mp4"
+
+        # In no_viewer mode, always save both videos if save_video is specified
+        if args.no_viewer:
+            print("Saving videos in --no_viewer mode...")
+
+            # Save point cloud video using Open3D offline rendering
+            save_pointcloud_video_offline(
+                predictions, images_cpu, pointcloud_video_path,
+                fps=args.video_fps, resolution=args.video_resolution,
+                conf_threshold=args.conf_threshold,
+                downsample_factor=args.downsample_factor,
+                mode=args.video_mode
+            )
+
+            # Save original video
+            save_original_video(
+                images_cpu, original_video_path,
+                fps=args.video_fps, resolution=args.video_resolution
+            )
+
+            print(f"Videos saved:")
+            print(f"  Point cloud video: {pointcloud_video_path}")
+            print(f"  Original video: {original_video_path}")
+
+        elif args.save_pointcloud_video:
+            # In viewer mode, save point cloud video on request
+            save_pointcloud_video_offline(
+                predictions, images_cpu, pointcloud_video_path,
+                fps=args.video_fps, resolution=args.video_resolution,
+                conf_threshold=args.conf_threshold,
+                downsample_factor=args.downsample_factor,
+                mode=args.video_mode
+            )
+            # Also save original video
+            save_original_video(
+                images_cpu, original_video_path,
+                fps=args.video_fps, resolution=args.video_resolution
+            )
+        else:
+            # Only save original video (no point cloud)
+            save_original_video(
+                images_cpu, original_video_path,
+                fps=args.video_fps, resolution=args.video_resolution
+            )
+        print("Video saving complete.")
+
+    # ── Skip viewer if requested ────────────────────────────────────────────────
     if args.no_viewer:
         print("Skipping viewer (--no_viewer mode).")
         print(f"Predictions contain keys: {list(predictions.keys())}")
         return
 
+    # ── Visualize ────────────────────────────────────────────────────────────────
     try:
         from lingbot_map.vis import PointCloudViewer
         viewer = PointCloudViewer(
@@ -396,6 +531,7 @@ def main():
         )
         print(f"3D viewer at http://localhost:{args.port}")
         viewer.run()
+
     except ImportError:
         print("viser not installed. Install with: pip install lingbot-map[vis]")
         print(f"Predictions contain keys: {list(predictions.keys())}")
@@ -516,6 +652,300 @@ def export_depth_and_pose(predictions, output_dir, images=None):
     print(f"  Saved intrinsic: {intrinsic_path} ({S} lines, 9 numbers each)")
 
     print(f"Depth and pose export complete!")
+
+
+def save_original_video(images, output_path, fps=30, resolution="1920x1080"):
+    """Save original images as a video file.
+
+    Args:
+        images: Image tensor or numpy array (S, 3, H, W) or (S, H, W, 3)
+        output_path: Path to save the video (e.g., output.mp4)
+        fps: Frame rate (default: 30)
+        resolution: Resolution string (e.g., "1920x1080")
+    """
+    import subprocess
+    import tempfile
+    import shutil
+
+    width, height = map(int, resolution.split('x'))
+
+    # Convert to numpy if needed
+    if isinstance(images, torch.Tensor):
+        images_np = images.cpu().numpy()
+    else:
+        images_np = images
+
+    # Handle batch dimension
+    if images_np.ndim == 5 and images_np.shape[0] == 1:
+        images_np = images_np[0]
+
+    S = images_np.shape[0]
+
+    # Convert (S, 3, H, W) -> (S, H, W, 3)
+    if images_np.ndim == 4 and images_np.shape[1] == 3:
+        images_np = images_np.transpose(0, 2, 3, 1)
+
+    print(f"Saving original video to {output_path}...")
+    print(f"  Resolution: {width}x{height}, FPS: {fps}, Frames: {S}")
+
+    temp_dir = tempfile.mkdtemp(prefix="original_video_")
+
+    try:
+        for i in tqdm(range(S), desc="Preparing frames"):
+            img = images_np[i]
+            # Convert from float [0,1] to uint8 [0,255]
+            if img.dtype != np.uint8:
+                img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+            # Resize to target resolution
+            img_resized = cv2.resize(img, (width, height))
+            # Convert RGB to BGR for cv2
+            img_bgr = cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR)
+            frame_path = os.path.join(temp_dir, f"frame_{i:06d}.png")
+            cv2.imwrite(frame_path, img_bgr)
+
+        print("Encoding video with ffmpeg...")
+        ffmpeg_cmd = [
+            'ffmpeg', '-y', '-framerate', str(fps),
+            '-i', os.path.join(temp_dir, 'frame_%06d.png'),
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18',
+            output_path
+        ]
+
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            print(f"Original video saved successfully to {output_path}")
+        else:
+            print(f"FFmpeg error: {result.stderr}")
+
+    finally:
+        shutil.rmtree(temp_dir)
+        print("Temporary files cleaned up")
+
+
+def save_pointcloud_video_offline(predictions, images, output_path, fps=30, resolution="1920x1080",
+                                   conf_threshold=1.5, downsample_factor=10, mode="accumulate"):
+    """Save point cloud video using Open3D offline rendering (GPU accelerated, no browser needed).
+
+    Args:
+        predictions: Dictionary containing 'world_points', 'extrinsic', 'depth', etc.
+        images: Image tensor for color
+        output_path: Path to save the video
+        fps: Frame rate
+        resolution: Resolution string
+        conf_threshold: Confidence threshold for filtering points
+        downsample_factor: Downsample factor
+        mode: "accumulate" (show all points up to current) or "single" (show only current frame)
+    """
+    import subprocess
+    import tempfile
+    import shutil
+    import open3d as o3d
+    from scipy.spatial.transform import Rotation
+    from lingbot_map.utils.geometry import unproject_depth_map_to_point_map
+
+    width, height = map(int, resolution.split('x'))
+
+    # Get point cloud data
+    extrinsics = predictions.get("extrinsic")
+    intrinsics = predictions.get("intrinsic")
+    depth = predictions.get("depth")
+    depth_conf = predictions.get("depth_conf")
+
+    if extrinsics is None or intrinsics is None or depth is None:
+        print("Error: Required data not found in predictions")
+        return
+
+    # Convert to numpy
+    if isinstance(extrinsics, torch.Tensor):
+        extrinsics = extrinsics.numpy()
+    if isinstance(intrinsics, torch.Tensor):
+        intrinsics = intrinsics.numpy()
+    if isinstance(depth, torch.Tensor):
+        depth = depth.numpy()
+    if isinstance(depth_conf, torch.Tensor):
+        depth_conf = depth_conf.numpy()
+    if isinstance(images, torch.Tensor):
+        images = images.cpu().numpy()
+
+    # Handle batch dimension
+    if images.ndim == 5 and images.shape[0] == 1:
+        images = images[0]
+    if images.ndim == 4 and images.shape[1] == 3:
+        images = images.transpose(0, 2, 3, 1)
+
+    # Compute world points
+    print("Computing world points from depth...")
+    world_points = unproject_depth_map_to_point_map(depth, extrinsics, intrinsics)
+
+    # Compute coordinate alignment transformation (same as export_raw_ply)
+    extrinsic_0_4x4 = np.eye(4)
+    extrinsic_0_4x4[:3, :4] = extrinsics[0]
+
+    # OpenGL conversion matrix (flip Y and Z)
+    opengl_conversion = np.eye(4)
+    opengl_conversion[1, 1] = -1
+    opengl_conversion[2, 2] = -1
+
+    # Align rotation (180 deg around Y)
+    align_rotation = np.eye(4)
+    align_rotation[:3, :3] = Rotation.from_euler("y", 180, degrees=True).as_matrix()
+
+    initial_transform = np.linalg.inv(extrinsic_0_4x4) @ opengl_conversion @ align_rotation
+    print("Applying OpenGL coordinate alignment transformation...")
+
+    S = world_points.shape[0]
+    print(f"Saving point cloud video to {output_path}...")
+    print(f"  Resolution: {width}x{height}, FPS: {fps}, Frames: {S}, Mode: {mode}")
+
+    # Collect all points for setting camera view (apply transform)
+    all_valid_points = []
+    for i in range(S):
+        pts = world_points[i].reshape(-1, 3)
+        conf = depth_conf[i].reshape(-1) if depth_conf is not None else np.ones(len(pts))
+        valid = np.isfinite(pts).all(axis=1) & np.any(pts != 0, axis=1) & (conf > conf_threshold)
+        if np.sum(valid) > 0:
+            pts_valid = pts[valid]
+            # Apply transformation: pts_aligned = pts @ R.T + t
+            pts_aligned = pts_valid @ initial_transform[:3, :3].T + initial_transform[:3, 3]
+            if downsample_factor > 1:
+                pts_aligned = pts_aligned[::downsample_factor]
+            all_valid_points.append(pts_aligned)
+
+    if len(all_valid_points) == 0:
+        print("Error: No valid points found")
+        return
+
+    all_points = np.concatenate(all_valid_points, axis=0)
+
+    # Compute scene bounds for camera setup
+    center = np.mean(all_points, axis=0)
+    extent = np.percentile(np.abs(all_points - center), 95) * 1.2
+
+    temp_dir = tempfile.mkdtemp(prefix="pointcloud_video_")
+
+    # Create renderer once (more efficient than creating per-frame)
+    print("Initializing Open3D OffscreenRenderer...")
+    renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
+
+    # Setup material for point rendering
+    mat = o3d.visualization.rendering.MaterialRecord()
+    mat.shader = "defaultUnlit"
+    mat.point_size = 2.0  # Set point size in material
+
+    # Camera setup parameters
+    fov_deg = 60
+    cam_radius = extent * 2.5
+
+    try:
+        accumulated_points = []
+        accumulated_colors = []
+
+        for i in tqdm(range(S), desc="Rendering frames"):
+            pts = world_points[i].reshape(-1, 3)
+            conf = depth_conf[i].reshape(-1) if depth_conf is not None else np.ones(len(pts))
+            colors = images[i].reshape(-1, 3) if images is not None else np.ones((len(pts), 3))
+
+            valid = np.isfinite(pts).all(axis=1) & np.any(pts != 0, axis=1) & (conf > conf_threshold)
+
+            if np.sum(valid) > 0:
+                pts_valid = pts[valid]
+                colors_valid = colors[valid]
+
+                # Apply OpenGL transformation: pts_aligned = pts @ R.T + t
+                pts_aligned = pts_valid @ initial_transform[:3, :3].T + initial_transform[:3, 3]
+
+                # Downsample
+                if downsample_factor > 1:
+                    indices = np.arange(0, len(pts_aligned), downsample_factor)
+                    pts_aligned = pts_aligned[indices]
+                    colors_valid = colors_valid[indices]
+
+                if mode == "accumulate":
+                    accumulated_points.append(pts_aligned)
+                    accumulated_colors.append(colors_valid)
+                else:  # single mode
+                    accumulated_points = [pts_aligned]
+                    accumulated_colors = [colors_valid]
+
+            # Combine all accumulated points
+            if len(accumulated_points) > 0:
+                all_pts = np.concatenate(accumulated_points, axis=0)
+                all_cols = np.concatenate(accumulated_colors, axis=0)
+
+                # Create point cloud
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(all_pts)
+                pcd.colors = o3d.utility.Vector3dVector(all_cols)
+
+                # Slowly rotate camera for dynamic view
+                angle = i * 0.5  # degrees per frame
+                rad = np.radians(angle)
+
+                # Camera position rotating around the scene
+                cam_x = center[0] + cam_radius * np.sin(rad)
+                cam_y = center[1]
+                cam_z = center[2] + cam_radius * np.cos(rad)
+
+                # Camera extrinsics (look at center from rotating position)
+                front = center - np.array([cam_x, cam_y, cam_z])
+                front = front / np.linalg.norm(front)
+                up = np.array([0.0, 1.0, 0.0])
+                right = np.cross(up, front)
+                right = right / np.linalg.norm(right)
+                up = np.cross(front, right)
+
+                # Clear previous geometry and add new one
+                renderer.scene.clear_geometry()
+                renderer.scene.add_geometry("points", pcd, mat)
+
+                # Setup camera using setup_camera method
+                # Parameters: vertical_fov, center_lookat, eye_position, up_vector
+                eye_position = np.array([cam_x, cam_y, cam_z], dtype=np.float32)
+                center_lookat = np.array(center, dtype=np.float32)
+                up_vector = np.array(up, dtype=np.float32)
+                renderer.setup_camera(fov_deg, center_lookat, eye_position, up_vector)
+
+                # Capture image
+                image = renderer.render_to_image()
+                frame = np.asarray(image)
+                # image is RGB uint8, convert to BGR for cv2
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+                frame_path = os.path.join(temp_dir, f"frame_{i:06d}.png")
+                cv2.imwrite(frame_path, frame_bgr)
+
+            else:
+                # No valid points, save black frame
+                frame = np.zeros((height, width, 3), dtype=np.uint8)
+                frame_path = os.path.join(temp_dir, f"frame_{i:06d}.png")
+                cv2.imwrite(frame_path, frame)
+
+        print("Encoding video with ffmpeg...")
+        ffmpeg_cmd = [
+            'ffmpeg', '-y', '-framerate', str(fps),
+            '-i', os.path.join(temp_dir, 'frame_%06d.png'),
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18',
+            output_path
+        ]
+
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            print(f"Point cloud video saved successfully to {output_path}")
+        else:
+            print(f"FFmpeg error: {result.stderr}")
+
+    except Exception as e:
+        print(f"Error during rendering: {e}")
+        import traceback
+        traceback.print_exc()
+
+    finally:
+        # Clean up renderer
+        renderer = None
+        shutil.rmtree(temp_dir)
+        print("Temporary files cleaned up")
 
 
 def export_raw_ply(predictions, images, output_path, conf_threshold=1.5, downsample_factor=10, use_depth=True):

@@ -19,7 +19,7 @@ from lingbot_map.layers.rope import WanRotaryPosEmbed
 from functools import partial
 from torch.utils.checkpoint import checkpoint
 
-
+ 
 class CameraHead(nn.Module):
     """
     CameraHead predicts camera parameters from token representations using iterative refinement.

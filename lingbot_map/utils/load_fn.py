@@ -97,7 +97,7 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
     return images, original_coords
 
 
-def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=None, mode="crop", image_size=512, patch_size=16):
+def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=None, mode="crop", image_size=512, patch_size=16, test_resolution=None):
     """
     A quick start function to load and preprocess images for model input.
     This assumes the images should have the same shape for easier batching, but our model can also work well with different shapes.
@@ -108,6 +108,11 @@ def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=No
                              - "crop" (default): Sets width to 518px and center crops height if needed.
                              - "pad": Preserves all pixels by making the largest dimension 518px
                                and padding the smaller dimension to reach a square shape.
+        test_resolution (str, optional): Test resolution override. If set, images are resized to this resolution
+                             before any other preprocessing. Options: "240p", "360p", "480p".
+                             - 240p: 308x238 (14*22, 14*17)
+                             - 360p: 476x350 (14*34, 14*25)
+                             - 480p: 630x476 (14*45, 14*34)
 
     Returns:
         torch.Tensor: Batched tensor of preprocessed images with shape (N, 3, H, W)
@@ -128,11 +133,24 @@ def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=No
     if len(image_path_list) == 0:
         raise ValueError("At least 1 image is required")
 
-        
-
     # Validate mode
     if mode not in ["crop", "pad"]:
         raise ValueError("Mode must be either 'crop' or 'pad'")
+
+    # Handle test_resolution override
+    if test_resolution is not None:
+        resolution_map = {
+            "240p": (308, 238),   # width, height (14*22, 14*17)
+            "360p": (476, 350),   # width, height (14*34, 14*25)
+            "480p": (630, 476),   # width, height (14*45, 14*34)
+        }
+        if test_resolution not in resolution_map:
+            raise ValueError(f"Invalid test_resolution: {test_resolution}. Must be '240p', '360p' or '480p'")
+        target_width, target_height = resolution_map[test_resolution]
+        print(f"Test resolution enabled: resizing images to {target_width}x{target_height} ({test_resolution})")
+    else:
+        target_width = None
+        target_height = None
 
     target_size = image_size
     to_tensor = TF.ToTensor()
@@ -147,6 +165,22 @@ def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=No
 
         width, height = img.size
 
+        # If test_resolution is set, resize directly to target resolution
+        if target_width is not None and target_height is not None:
+            new_width = target_width
+            new_height = target_height
+        else:
+            if mode == "pad":
+                if width >= height:
+                    new_width = target_size
+                    new_height = round(height * (new_width / width) / patch_size) * patch_size
+                else:
+                    new_height = target_size
+                    new_width = round(width * (new_height / height) / patch_size) * patch_size
+            else:  # crop
+                new_width = target_size
+                new_height = round(height * (new_width / width) / patch_size) * patch_size
+
         fx_val = fy_val = cx_val = cy_val = None
         if fx is not None:
             fx_val = fx[i] * width
@@ -154,21 +188,11 @@ def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=No
             cx_val = cx[i] * width
             cy_val = cy[i] * height
 
-        if mode == "pad":
-            if width >= height:
-                new_width = target_size
-                new_height = round(height * (new_width / width) / patch_size) * patch_size
-            else:
-                new_height = target_size
-                new_width = round(width * (new_height / height) / patch_size) * patch_size
-        else:  # crop
-            new_width = target_size
-            new_height = round(height * (new_width / width) / patch_size) * patch_size
-
         img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
         img = to_tensor(img)
 
-        if mode == "crop" and new_height > target_size:
+        # Apply center crop only in non-test mode
+        if test_resolution is None and mode == "crop" and new_height > target_size:
             start_y = (new_height - target_size) // 2
             img = img[:, start_y : start_y + target_size, :]
 
@@ -178,7 +202,8 @@ def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=No
             cx_val = img.shape[2] / 2
             cy_val = img.shape[1] / 2
 
-        if mode == "pad":
+        # Apply padding only in non-test mode with mode="pad"
+        if test_resolution is None and mode == "pad":
             h_padding = target_size - img.shape[1]
             w_padding = target_size - img.shape[2]
             if h_padding > 0 or w_padding > 0:

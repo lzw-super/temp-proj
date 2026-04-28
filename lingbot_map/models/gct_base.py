@@ -317,7 +317,7 @@ class GCTBase(nn.Module, PyTorchModelHubMixin, ABC):
                 - world_points: 3D world coordinates [B, S, H, W, 3]
                 - world_points_conf: Point confidence [B, S, H, W]
         """
-        images, query_points = self._normalize_input(images, query_points)
+        images, query_points = self._normalize_input(images, query_points)  # 用于匹配模型的输入格式
 
         aggregated_tokens_list, patch_start_idx = self._aggregate_features(
             images,

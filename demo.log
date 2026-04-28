@@ -1,0 +1,9 @@
+2026-04-28 21:12:08,868 - dinov2 - INFO - using MLP layer as FFN
+2026-04-28 21:12:10,540 - lingbot_map.aggregator.base - WARNING - Failed to load pretrained weights: [Errno 2] No such file or directory: ''
+2026-04-28 21:12:12,260 - lingbot_map.aggregator.stream - INFO - SDPA KV cache initialized with 24 blocks
+2026-04-28 21:12:12,261 - lingbot_map.aggregator.stream - INFO - 3D RoPE initialized for max 1024 frames, head_dim=64
+2026-04-28 21:12:15,204 - lingbot_map.aggregator.stream - INFO - KV cache cleaned
+2026-04-28 21:12:15,204 - lingbot_map.models.gct_stream - INFO - Processing 8 scale frames...
+2026-04-28 21:12:16,075 - lingbot_map.models.gct_stream - INFO - Scale frames (8 frames) processed in 0.87s, avg 0.109s/frame
+2026-04-28 21:13:19,064 - lingbot_map.models.gct_stream - INFO - Streaming frames (242 frames) processed in 62.99s, avg 0.260s/frame
+2026-04-28 21:13:19,067 - lingbot_map.models.gct_stream - INFO - Total: 250 frames (518x294) processed in 63.86s, avg 0.255s/frame (3.9 FPS)

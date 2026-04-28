@@ -18,7 +18,7 @@ from lingbot_map.layers.rope import WanRotaryPosEmbed
 from lingbot_map.aggregator.base import AggregatorBase, slice_expand_and_flatten
 
 logger = logging.getLogger(__name__)
-
+ 
 
 class AggregatorStream(AggregatorBase):
     """
