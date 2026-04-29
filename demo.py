@@ -40,7 +40,7 @@ logging.basicConfig(
 )
 
 from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
-from lingbot_map.utils.geometry import closed_form_inverse_se3_general
+from lingbot_map.utils.geometry import closed_form_inverse_se3_general , closed_form_inverse_se3
 from lingbot_map.utils.load_fn import load_and_preprocess_images
 
 
@@ -316,11 +316,11 @@ def main():
 
     # Video saving options
     parser.add_argument("--save_video", type=str, default=None,
-                        help="Save videos to specified path (e.g., output). "
-                             "Generates: output_pointcloud.mp4 (point cloud animation) "
-                             "and output_original.mp4 (original images). "
-                             "In --no_viewer mode: always saves both videos. "
-                             "In viewer mode: saves original only, unless --save_pointcloud_video is set.")
+                        help="Save videos to specified path. "
+                             "Options: 'auto' (save to dataset folder), or specify path (e.g., output). "
+                             "Generates: *_pointcloud.mp4 (point cloud animation) "
+                             "and *_original.mp4 (original images). "
+                             "In --no_viewer mode: always saves both videos.")
     parser.add_argument("--video_fps", type=int, default=10,
                         help="Video frame rate (default: 10)")
     parser.add_argument("--video_resolution", type=str, default="1920x1080",
@@ -333,6 +333,10 @@ def main():
                         choices=["accumulate", "single"],
                         help="Point cloud video mode: 'accumulate' shows all frames up to current "
                              "(3D mode), 'single' shows only current frame (4D mode)")
+    parser.add_argument("--export_video_data", type=str, default=None,
+                        help="Export data for save_pointcloud_video_offline testing. "
+                             "Specify directory path to save extrinsic.npy, intrinsic.npy, "
+                             "depth.npy, depth_conf.npy, images.npy")
 
     args = parser.parse_args()
     assert args.image_folder or args.video_path, \
@@ -438,11 +442,11 @@ def main():
         print(f"  Saved {S} RGB images ({W}x{H}) to {test_output_dir}/")
 
     # ── Export PLY (if requested) ─────────────────────────────────────────────
-    if args.export_ply:
-        use_filtering = not args.ply_raw
-        print(f"Exporting point cloud to {args.export_ply}...")
+    if args.export_ply or args.image_folder:
+        use_filtering = not args.ply_raw 
+        print(f"Exporting point cloud to {os.path.dirname(args.image_folder)}...")
         export_raw_ply(
-            predictions, images_cpu, args.export_ply,
+            predictions, images_cpu, os.path.dirname(args.image_folder),
             conf_threshold=args.ply_conf_threshold if use_filtering else 0,
             downsample_factor=args.ply_downsample if use_filtering else 1,
             use_depth=args.ply_use_depth,
@@ -452,17 +456,40 @@ def main():
     if args.export_depth_pose:
         export_depth_and_pose(predictions, args.export_depth_pose, images_cpu)
 
+    # ── Export video data for testing (if requested) ───────────────────────────
+    if args.export_video_data:
+        export_video_data(predictions, images_cpu, args.export_video_data)
+
     # ── Save video (if requested) ───────────────────────────────────────────────
-    if args.save_video:
-        # Generate video paths
-        video_base_path = args.save_video
-        if not video_base_path.endswith('.mp4'):
-            video_base_path = video_base_path + '.mp4'
+    if args.save_video or args.image_folder:
+        # Determine video output directory
+        # If save_video is a directory or empty, use dataset directory
+        if args.save_video == "auto" or args.save_video == "" or args.image_folder :
+            # Auto-detect dataset directory from input source
+            if args.image_folder:
+                video_output_dir = os.path.dirname(args.image_folder) # 父目录
+            elif args.video_path:
+                video_output_dir = os.path.dirname(args.video_path)
+            else:
+                video_output_dir = resolved_image_folder
+            # Use dataset folder name as video prefix
+            dataset_name = os.path.basename(video_output_dir.rstrip('/'))
+            video_base_path = os.path.join(video_output_dir, f"{dataset_name}_pointcloud.mp4")
+        else:
+            # Use specified path
+            video_base_path = args.save_video
+            if not video_base_path.endswith('.mp4'):
+                video_base_path = video_base_path + '.mp4'
 
         # Extract base name for related videos
         base_name = os.path.splitext(video_base_path)[0]
         pointcloud_video_path = f"{base_name}_pointcloud.mp4"
         original_video_path = f"{base_name}_original.mp4"
+
+        print(f"Videos will be saved to:")
+        print(f"  Directory: {os.path.dirname(pointcloud_video_path)}")
+        print(f"  Point cloud: {os.path.basename(pointcloud_video_path)}")
+        print(f"  Original: {os.path.basename(original_video_path)}")
 
         # In no_viewer mode, always save both videos if save_video is specified
         if args.no_viewer:
@@ -654,6 +681,66 @@ def export_depth_and_pose(predictions, output_dir, images=None):
     print(f"Depth and pose export complete!")
 
 
+def export_video_data(predictions, images, output_dir):
+    """Export data needed for save_pointcloud_video_offline to npy files.
+
+    Saves:
+    - extrinsic.npy: (S, 3, 4) camera extrinsics (c2w)
+    - intrinsic.npy: (S, 3, 3) camera intrinsics
+    - depth.npy: (S, H, W, 1) depth maps
+    - depth_conf.npy: (S, H, W) depth confidence
+    - images.npy: (S, H, W, 3) RGB images
+
+    Args:
+        predictions: Dictionary containing 'extrinsic', 'intrinsic', 'depth', 'depth_conf'
+        images: Image tensor (S, 3, H, W) or (S, H, W, 3)
+        output_dir: Directory to save the files
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    extrinsics = predictions.get("extrinsic")
+    intrinsics = predictions.get("intrinsic")
+    depth = predictions.get("depth")
+    depth_conf = predictions.get("depth_conf")
+
+    # Convert to numpy
+    if isinstance(extrinsics, torch.Tensor):
+        extrinsics = extrinsics.numpy()
+    if isinstance(intrinsics, torch.Tensor):
+        intrinsics = intrinsics.numpy()
+    if isinstance(depth, torch.Tensor):
+        depth = depth.numpy()
+    if isinstance(depth_conf, torch.Tensor):
+        depth_conf = depth_conf.numpy()
+    if isinstance(images, torch.Tensor):
+        images = images.cpu().numpy()
+
+    # Handle batch dimension for images
+    if images.ndim == 5 and images.shape[0] == 1:
+        images = images[0]
+
+    # Convert (S, 3, H, W) -> (S, H, W, 3)
+    if images.ndim == 4 and images.shape[1] == 3:
+        images = images.transpose(0, 2, 3, 1)
+
+    S = depth.shape[0]
+    print(f"Exporting video data for {S} frames to {output_dir}")
+
+    # Save each array
+    np.save(os.path.join(output_dir, "extrinsic.npy"), extrinsics)
+    np.save(os.path.join(output_dir, "intrinsic.npy"), intrinsics)
+    np.save(os.path.join(output_dir, "depth.npy"), depth)
+    np.save(os.path.join(output_dir, "depth_conf.npy"), depth_conf)
+    np.save(os.path.join(output_dir, "images.npy"), images)
+
+    print(f"  extrinsic.npy: {extrinsics.shape}")
+    print(f"  intrinsic.npy: {intrinsics.shape}")
+    print(f"  depth.npy: {depth.shape}")
+    print(f"  depth_conf.npy: {depth_conf.shape}")
+    print(f"  images.npy: {images.shape}")
+    print(f"Video data export complete!")
+
+
 def save_original_video(images, output_path, fps=30, resolution="1920x1080"):
     """Save original images as a video file.
 
@@ -791,7 +878,8 @@ def save_pointcloud_video_offline(predictions, images, output_path, fps=30, reso
     align_rotation = np.eye(4)
     align_rotation[:3, :3] = Rotation.from_euler("y", 180, degrees=True).as_matrix()
 
-    initial_transform = np.linalg.inv(extrinsic_0_4x4) @ opengl_conversion @ align_rotation
+    initial_transform = np.linalg.inv(extrinsic_0_4x4) @ opengl_conversion @ align_rotation 
+    # initial_transform = extrinsic_0_4x4 @ opengl_conversion @ align_rotation
     print("Applying OpenGL coordinate alignment transformation...")
 
     S = world_points.shape[0]
@@ -834,8 +922,7 @@ def save_pointcloud_video_offline(predictions, images, output_path, fps=30, reso
     mat.point_size = 2.0  # Set point size in material
 
     # Camera setup parameters
-    fov_deg = 60
-    cam_radius = extent * 2.5
+    fov_deg = 60  # Field of view for rendering
 
     try:
         accumulated_points = []
@@ -878,32 +965,47 @@ def save_pointcloud_video_offline(predictions, images, output_path, fps=30, reso
                 pcd.points = o3d.utility.Vector3dVector(all_pts)
                 pcd.colors = o3d.utility.Vector3dVector(all_cols)
 
-                # Slowly rotate camera for dynamic view
-                angle = i * 0.5  # degrees per frame
-                rad = np.radians(angle)
+                # Use actual camera trajectory for view
+                # extrinsics is c2w (camera to world) - already converted in postprocess()
+                #   [:3, 3] = camera position in world coords (translation)
+                #   [:3, 0] = camera X axis (right direction) in world
+                #   [:3, 1] = camera Y axis (up direction) in world
+                #   [:3, 2] = camera Z axis in world (points forward in camera convention!)
+                #
+                # IMPORTANT: In OpenCV camera convention, camera looks toward +Z
+                # So forward (viewing) direction = +column 2 = +Z axis (the [:3, 2] column)
+                cam_to_world_extrinsic = closed_form_inverse_se3(extrinsics[i][None])[0]                                                         
+                cam_position_w = cam_to_world_extrinsic[:3, 3]      # Position = translation part                                               
+                cam_forward_w = -cam_to_world_extrinsic[:3, 2]      # Forward = -Z axis (camera viewing direction)                              
+                cam_up_w = -cam_to_world_extrinsic[:3, 1]            # Up = Y axis  
 
-                # Camera position rotating around the scene
-                cam_x = center[0] + cam_radius * np.sin(rad)
-                cam_y = center[1]
-                cam_z = center[2] + cam_radius * np.cos(rad)
 
-                # Camera extrinsics (look at center from rotating position)
-                front = center - np.array([cam_x, cam_y, cam_z])
-                front = front / np.linalg.norm(front)
-                up = np.array([0.0, 1.0, 0.0])
-                right = np.cross(up, front)
-                right = right / np.linalg.norm(right)
-                up = np.cross(front, right)
+                # Apply OpenGL transformation to camera position and directions
+                # For point cloud: pts' = pts @ R.T + t (row vector form)
+                # For camera position (column vector): pos' = R @ pos + t
+                R_gl = initial_transform[:3, :3]
+                t_gl = initial_transform[:3, 3]
+
+                cam_position = cam_position_w @ R_gl.T + t_gl
+                cam_forward = cam_forward_w @ R_gl.T 
+                cam_forward = cam_forward / np.linalg.norm(cam_forward)
+                cam_up = cam_up_w @ R_gl.T 
+                cam_up = cam_up / np.linalg.norm(cam_up)
+
+                # Lookat: camera should look in its forward direction (viewing direction)
+                # Use a point ahead of the camera along the forward direction
+                # lookat_distance = extent * 1.5  # Look some distance ahead
+                # lookat_point = cam_position + cam_forward * lookat_distance 
+                lookat_point = np.mean(accumulated_points[-1], axis=0) if len(accumulated_points) > 0 else cam_position + cam_forward * extent
 
                 # Clear previous geometry and add new one
                 renderer.scene.clear_geometry()
                 renderer.scene.add_geometry("points", pcd, mat)
 
-                # Setup camera using setup_camera method
-                # Parameters: vertical_fov, center_lookat, eye_position, up_vector
-                eye_position = np.array([cam_x, cam_y, cam_z], dtype=np.float32)
-                center_lookat = np.array(center, dtype=np.float32)
-                up_vector = np.array(up, dtype=np.float32)
+                # Setup camera following actual trajectory
+                eye_position = np.array(cam_position, dtype=np.float32)
+                center_lookat = np.array(lookat_point, dtype=np.float32)
+                up_vector = np.array(cam_up, dtype=np.float32)
                 renderer.setup_camera(fov_deg, center_lookat, eye_position, up_vector)
 
                 # Capture image

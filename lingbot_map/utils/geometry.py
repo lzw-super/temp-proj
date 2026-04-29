@@ -23,7 +23,7 @@ except ImportError:
 
 
 def unproject_depth_map_to_point_map(
-    depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray
+    depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray, is_c2w: bool = False
 ) -> np.ndarray:
     """
     【主函数】将深度图批量反投影到3D世界坐标系
@@ -53,8 +53,8 @@ def unproject_depth_map_to_point_map(
 
         extrinsics_cam (np.ndarray): 相机外参矩阵批次
             - 形状: (S, 3, 4)
-            - 表示 camera-to-world (c2w) 变换矩阵
-            - 包含相机的旋转R(3x3)和平移t(3x1)
+            - 当 is_c2w=True 时: 表示 camera-to-world (c2w) 变换矩阵（直接使用）
+            - 当 is_c2w=False 时: 表示 world-to-camera (w2c) 变换矩阵（需求逆）
 
         intrinsics_cam (np.ndarray): 相机内参矩阵批次
             - 形状: (S, 3, 3)
@@ -63,6 +63,10 @@ def unproject_depth_map_to_point_map(
                            [ 0,  0,  1]
             - fx, fy: 焦距（像素单位）
             - cx, cy: 光心坐标（像素单位）
+
+        is_c2w (bool): 外参矩阵类型标志
+            - True (默认): extrinsics_cam 是 c2w，直接使用无需求逆
+            - False: extrinsics_cam 是 w2c，需要求逆得到 c2w
 
     Returns:
         np.ndarray: 3D世界坐标点云
@@ -95,7 +99,8 @@ def unproject_depth_map_to_point_map(
         cur_world_points, _, _ = depth_to_world_coords_points(
             depth_map[frame_idx].squeeze(-1),      # 当前帧深度图 (H, W)
             extrinsics_cam[frame_idx],              # 当前帧外参 (3, 4)
-            intrinsics_cam[frame_idx]               # 当前帧内参 (3, 3)
+            intrinsics_cam[frame_idx],               # 当前帧内参 (3, 3)
+            is_c2w=is_c2w                             # 传递外参类型标志
         )
         world_points_list.append(cur_world_points)
 
@@ -113,6 +118,7 @@ def depth_to_world_coords_points(
     depth_map: np.ndarray,
     extrinsic: np.ndarray,
     intrinsic: np.ndarray,
+    is_c2w: bool = False,
     eps=1e-8,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -161,21 +167,25 @@ def depth_to_world_coords_points(
             - 形状: (H, W)
             - 每个值表示像素点到相机光心的Z方向距离
 
+        extrinsic (np.ndarray): 相机外参矩阵
+            - 形状: (3, 4)
+            - OpenCV相机坐标系约定
+            - 格式: [R | t] (旋转矩阵R + 平移向量t)
+                   [r11 r12 r13 | t1]
+                   [r21 r22 r23 | t2]
+                   [r31 r32 r33 | t3]
+            - 当 is_c2w=True 时: 表示 camera-to-world (c2w)，直接使用
+            - 当 is_c2w=False 时: 表示 world-to-camera (w2c)，需求逆
+
         intrinsic (np.ndarray): 相机内参矩阵
             - 形状: (3, 3)
             - 格式: [fx,  0, cx]
                    [ 0, fy, cy]
                    [ 0,  0,  1]
 
-        extrinsic (np.ndarray): 相机外参矩阵
-            - 形状: (3, 4)
-            - OpenCV相机坐标系约定
-            - 表示 camera-from-world (w2c)，但实际代码中
-              需要求逆得到 world-from-camera (c2w)
-            - 格式: [R | t] (旋转矩阵R + 平移向量t)
-                   [r11 r12 r13 | t1]
-                   [r21 r22 r23 | t2]
-                   [r31 r32 r33 | t3]
+        is_c2w (bool): 外参矩阵类型标志
+            - True (默认): extrinsic 是 c2w，直接使用无需求逆
+            - False: extrinsic 是 w2c，需要求逆得到 c2w
 
         eps (float): 有效深度阈值，用于过滤无效深度值
 
@@ -209,15 +219,26 @@ def depth_to_world_coords_points(
     # ========================================
     # 步骤3: 相机坐标 → 世界坐标
     # ========================================
-    # 外参矩阵求逆: w2c → c2w
-    # extrinsic 是 world-to-camera (w2c)，需要求逆得到 camera-to-world (c2w)
+    # 根据is_c2w参数决定是否需要求逆
     #
-    # 数学推导:
-    #   w2c: P_camera = w2c × P_world
-    #   c2w: P_world = c2w × P_camera = inv(w2c) × P_camera
+    # 当 is_c2w=True 时:
+    #   extrinsic 已经是 camera-to-world (c2w)，直接使用
+    #   P_world = c2w × P_camera
     #
-    # 注意: extrinsic[None] 添加batch维度，因为closed_form_inverse_se3需要batch输入
-    cam_to_world_extrinsic = closed_form_inverse_se3(extrinsic[None])[0]
+    # 当 is_c2w=False 时:
+    #   extrinsic 是 world-to-camera (w2c)，需要求逆得到 c2w
+    #   P_world = inv(w2c) × P_camera = c2w × P_camera
+    #
+    # 注意: closed_form_inverse_se3 需要 batch 输入，所以用 extrinsic[None]
+    if is_c2w:
+        # extrinsic 已经是 c2w，直接使用
+        # 需要将 3x4 扩展为 4x4 以统一处理
+        cam_to_world_4x4 = np.eye(4)
+        cam_to_world_4x4[:3, :4] = extrinsic
+        cam_to_world_extrinsic = cam_to_world_4x4
+    else:
+        # extrinsic 是 w2c，需要求逆得到 c2w
+        cam_to_world_extrinsic = closed_form_inverse_se3(extrinsic[None])[0]
 
     # 从4x4矩阵中提取旋转部分R(3x3)和平移部分t(3x1)
     R_cam_to_world = cam_to_world_extrinsic[:3, :3]  # 旋转矩阵
