@@ -442,7 +442,7 @@ def main():
         print(f"  Saved {S} RGB images ({W}x{H}) to {test_output_dir}/")
 
     # ── Export PLY (if requested) ─────────────────────────────────────────────
-    if args.export_ply or args.image_folder:
+    if args.export_ply :
         use_filtering = not args.ply_raw 
         print(f"Exporting point cloud to {os.path.dirname(args.image_folder)}...")
         export_raw_ply(
@@ -461,7 +461,7 @@ def main():
         export_video_data(predictions, images_cpu, args.export_video_data)
 
     # ── Save video (if requested) ───────────────────────────────────────────────
-    if args.save_video or args.image_folder:
+    if args.save_video :
         # Determine video output directory
         # If save_video is a directory or empty, use dataset directory
         if args.save_video == "auto" or args.save_video == "" or args.image_folder :
@@ -599,12 +599,12 @@ def export_depth_and_pose(predictions, output_dir, images=None):
     if intrinsic is None:
         print("Error: 'intrinsic' not found in predictions")
         return
-    cam_to_world_extrinsic = closed_form_inverse_se3_general(extrinsic)
+    # cam_to_world_extrinsic = closed_form_inverse_se3_general(extrinsic)
     # Convert to numpy if needed
     if isinstance(depth, torch.Tensor):
         depth = depth.numpy()
-    if isinstance(cam_to_world_extrinsic, torch.Tensor):
-        cam_to_world_extrinsic = cam_to_world_extrinsic.numpy()
+    if isinstance(extrinsic, torch.Tensor):
+        extrinsic = extrinsic.numpy()
     if isinstance(intrinsic, torch.Tensor):
         intrinsic = intrinsic.numpy()
     if depth_conf is not None and isinstance(depth_conf, torch.Tensor):
@@ -612,6 +612,11 @@ def export_depth_and_pose(predictions, output_dir, images=None):
     if images is not None and isinstance(images, torch.Tensor):
         images = images.numpy()
 
+    extrinsic_4x4 = np.eye(4)[None].repeat(S, axis=0)  # (S, 4, 4)
+    extrinsic_4x4[:, :3, :4] = extrinsic
+
+    # 批量求逆：c2w → w2c
+    cam_to_world_extrinsic = closed_form_inverse_se3(extrinsic_4x4)
     # Remove last dimension if present (H, W, 1) -> (H, W)
     if depth.ndim == 4 and depth.shape[-1] == 1:
         depth = depth.squeeze(-1)
@@ -966,18 +971,36 @@ def save_pointcloud_video_offline(predictions, images, output_path, fps=30, reso
                 pcd.colors = o3d.utility.Vector3dVector(all_cols)
 
                 # Use actual camera trajectory for view
-                # extrinsics is c2w (camera to world) - already converted in postprocess()
-                #   [:3, 3] = camera position in world coords (translation)
-                #   [:3, 0] = camera X axis (right direction) in world
-                #   [:3, 1] = camera Y axis (up direction) in world
-                #   [:3, 2] = camera Z axis in world (points forward in camera convention!)
                 #
-                # IMPORTANT: In OpenCV camera convention, camera looks toward +Z
-                # So forward (viewing) direction = +column 2 = +Z axis (the [:3, 2] column)
-                cam_to_world_extrinsic = closed_form_inverse_se3(extrinsics[i][None])[0]                                                         
-                cam_position_w = cam_to_world_extrinsic[:3, 3]      # Position = translation part                                               
-                cam_forward_w = -cam_to_world_extrinsic[:3, 2]      # Forward = -Z axis (camera viewing direction)                              
-                cam_up_w = -cam_to_world_extrinsic[:3, 1]            # Up = Y axis  
+                # extrinsics is c2w (camera-to-world) - converted from w2c in postprocess()
+                # c2w 表示相机在世界坐标系中的位置和姿态:
+                #   [:3, 3] = 相机在世界坐标系中的位置 (translation)
+                #   [:3, 0] = 相机 X轴在世界坐标系中的方向 (right)
+                #   [:3, 1] = 相机 Y轴在世界坐标系中的方向 (up/down in OpenCV)
+                #   [:3, 2] = 相机 Z轴在世界坐标系中的方向 (forward in OpenCV)
+                #
+                # 对于渲染，需要 w2c (world-to-camera) 视角矩阵:
+                # w2c = inv(c2w) 描述"世界如何投影到相机"
+                # Open3D setup_camera 需要相机视角信息（eye, lookat, up）
+                # 这些信息从 w2c 矩阵中提取更直接
+                #
+                # w2c 的结构（对 c2w 求逆后）:
+                #   [:3, 3] = -R^T @ t (世界原点在相机坐标系中的位置)
+                #   [:3, 2] = R的第3行 = 相机Z轴在世界坐标系中的方向 (forward)
+                #   [:3, 1] = R的第2行 = 相机Y轴在世界坐标系中的方向 (up)
+                #
+                # IMPORTANT: 在 OpenGL/Open3D 渲染中:
+                #   - forward = 相机朝向方向（看向场景）
+                #   - 在 OpenCV 约定中，相机看向 +Z
+                #   - 所以 forward = [:3, 2] (Z轴方向)
+                #   - up = [:3, 1] (Y轴方向，OpenCV中向下，需要取负)
+
+                # 将 c2w 转换为 w2c (求逆)
+                cam_to_world_extrinsic = closed_form_inverse_se3(extrinsics[i][None])[0]
+                # 从 w2c 矩阵提取相机视角信息
+                cam_position_w = cam_to_world_extrinsic[:3, 3]       # 相机位置（从w2c提取）
+                cam_forward_w = -cam_to_world_extrinsic[:3, 2]       # Forward方向（相机看向的方向）
+                cam_up_w = -cam_to_world_extrinsic[:3, 1]            # Up方向（取负因为在OpenCV中Y向下）  
 
 
                 # Apply OpenGL transformation to camera position and directions

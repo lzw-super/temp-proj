@@ -52,7 +52,13 @@ $PYTHON /home/lizhengwu/desktop/temp_proj/lingbot-map/demo.py \
     --no_viewer \
     --export_depth_pose "$EXPORT_DEPTH_POSE_PATH" \
     --image_size 518 \
-    --export_video_data "$EXPORT_VIDEO_PATH"
+    --export_video_data "$EXPORT_VIDEO_PATH" \
+    --save_video \
+    --export_ply 
+
+
+
+
 
 # 5. 检查命令执行结果
 if [ $? -eq 0 ]; then

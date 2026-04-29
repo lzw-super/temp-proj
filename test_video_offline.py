@@ -187,18 +187,33 @@ def save_pointcloud_video_offline(predictions, images, output_path, fps=30, reso
                 pcd.colors = o3d.utility.Vector3dVector(all_cols)
 
                 # Use actual camera trajectory for view
-                # extrinsics is c2w (camera to world) - already converted in postprocess()
-                #   [:3, 3] = camera position in world coords (translation)
-                #   [:3, 0] = camera X axis (right direction) in world
-                #   [:3, 1] = camera Y axis (up direction) in world
-                #   [:3, 2] = camera Z axis in world (points forward in camera convention!)
                 #
-                # IMPORTANT: In OpenCV camera convention, camera looks toward +Z
-                # So forward (viewing) direction = +column 2 = +Z axis (the [:3, 2] column)
-                cam_to_world_extrinsic = closed_form_inverse_se3(extrinsics[i][None])[0]                                                         
-                cam_position_w = cam_to_world_extrinsic[:3, 3]      # Position = translation part                                               
-                cam_forward_w = -cam_to_world_extrinsic[:3, 2]      # Forward = -Z axis (camera viewing direction)                              
-                cam_up_w = -cam_to_world_extrinsic[:3, 1]            # Up = Y axis  
+                # extrinsics is c2w (camera-to-world) - converted from w2c in postprocess()
+                # c2w 表示相机在世界坐标系中的位置和姿态:
+                #   [:3, 3] = 相机在世界坐标系中的位置 (translation)
+                #   [:3, 0] = 相机 X轴在世界坐标系中的方向 (right)
+                #   [:3, 1] = 相机 Y轴在世界坐标系中的方向 (up/down in OpenCV)
+                #   [:3, 2] = 相机 Z轴在世界坐标系中的方向 (forward in OpenCV)
+                #
+                # 对于渲染，需要 w2c (world-to-camera) 视角矩阵:
+                # w2c = inv(c2w) 描述"世界如何投影到相机"
+                # Open3D setup_camera 需要相机视角信息（eye, lookat, up）
+                # 这些信息从 w2c 矩阵中提取更直接
+                #
+                # 使用 closed_form_inverse_se3 批量求逆（支持 NumPy）
+                # extrinsics 是 (S, 3, 4)，需要转换为 (S, 4, 4) 格式
+
+                # 将 3x4 扩展为 4x4 格式
+                extrinsic_4x4 = np.eye(4)[None].repeat(S, axis=0)  # (S, 4, 4)
+                extrinsic_4x4[:, :3, :4] = extrinsics
+
+                # 批量求逆：c2w → w2c
+                cam_to_world_extrinsic = closed_form_inverse_se3(extrinsic_4x4)  # (S, 4, 4)
+
+                # 从 w2c 矩阵提取相机视角信息
+                cam_position_w = cam_to_world_extrinsic[i][:3, 3]       # 相机位置（从w2c提取）
+                cam_forward_w = -cam_to_world_extrinsic[i][:3, 2]       # Forward方向（相机看向的方向）
+                cam_up_w = -cam_to_world_extrinsic[i][:3, 1]            # Up方向（取负因为在OpenCV中Y向下）  
 
 
                 # Apply OpenGL transformation to camera position and directions

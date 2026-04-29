@@ -14,8 +14,8 @@
                 "--use_sdpa",
                 "--export_ply", "example/room4/room4.ply",
                 "--no_viewer",
-                "--export_depth_pose", "output/all", 
-                "--image_size", "630",
+                // "--export_depth_pose", "output/all", 
+                "--image_size", "518",
                 // "--test_resolution", "360p"
             ],
             "python": "/home/lizhengwu/miniconda3/envs/lingbot-map/bin/python",
