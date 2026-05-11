@@ -5,7 +5,7 @@
             "name": "Python: Debug Lingbot-Map demo",
             "type": "debugpy",
             "request": "launch",
-            "program": "${fileDirname}/demo.py",
+            "program": "${workspaceFolder}/demo.py",
             "console": "integratedTerminal",
             "args": [
                 "--model_path", "/home/shared_files/model_weights/linbo_map/lingbot-map.pt",
@@ -19,7 +19,7 @@
                 // "--test_resolution", "360p"
             ],
             "python": "/home/lizhengwu/miniconda3/envs/lingbot-map/bin/python",
-            "cwd": "${fileDirname}",
+            "cwd": "${workspaceFolder}",
             "justMyCode": true
         }
     ]

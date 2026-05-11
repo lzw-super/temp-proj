@@ -227,7 +227,7 @@ class DinoVisionTransformer(nn.Module):
 
     def prepare_tokens_with_masks(self, x, masks=None):
         B, nc, w, h = x.shape
-        x = self.patch_embed(x)
+        x = self.patch_embed(x)  #常规的patch embedding 294x518 -> 777x1024   294x518 = 777x14x14
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
 
@@ -267,7 +267,7 @@ class DinoVisionTransformer(nn.Module):
         if isinstance(x, list):
             return self.forward_features_list(x, masks)
 
-        x = self.prepare_tokens_with_masks(x, masks)
+        x = self.prepare_tokens_with_masks(x, masks)  #dino的基础编码 clstoken+regtokens+patchtokens 以及位置编码信息
 
         for blk in self.blocks:
             if self.training:
