@@ -19,3 +19,5 @@ output
 example/office2 
 video_data/
 video_data_*
+*.png
+*.pt
