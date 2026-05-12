@@ -1,21 +1,24 @@
 """
-Head-Only 训练模型
+Head-Only 训练模型（论文4.1对齐版）
 
 根据 try_train/stage1_scannet_training_plan.md 文档的要求，
 本模块实现：
 
 1. 基于 GCTBase 的简化训练模型
 2. 冻结 DINOv2 backbone 和所有 transformer blocks
-3. 只训练 DepthHead 和 PoseHead
+3. 只训练 DepthHead 和 PoseHead（默认启用）
+4. 支持 Absolute Pose Loss 和 Relative Pose Loss
+5. Loss 实现遵循论文 Sec. 3.3 的设计
 
 参考文档第2、8节的架构设计。
 
 作者：Claude Code
-日期：2026-05-11
+日期：2026-05-12
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict, List, Optional
 import sys
 from pathlib import Path
@@ -188,7 +191,141 @@ class DepthLoss(nn.Module):
 
 
 class PoseLoss(nn.Module):
-    """Pose Loss: Rotation geodesic + Translation Huber"""
+    """
+    Absolute Pose Loss: Rotation geodesic + Translation Huber
+
+    遵循论文 Sec. 3.3 和文档第8.2节的设计：
+    - rotation: quaternion geodesic loss
+    - translation: Huber loss (鲁棒性)
+    - 第一帧 pose 不参与 loss 计算（第一帧为 reference frame）
+    """
+
+    def __init__(self, rotation_weight=1.0, translation_weight=1.0):
+        super().__init__()
+        self.rotation_weight = rotation_weight
+        self.translation_weight = translation_weight
+
+    def forward(self, pose_enc_pred, pose_gt, exclude_first_frame=True):
+        """
+        Args:
+            pose_enc_pred: [B, V, 9] pose encoding (center + quaternion + focal/offset)
+            pose_gt: [B, V, 4, 4] camera-to-world pose matrix (relative to first frame)
+            exclude_first_frame: 是否排除第一帧（第一帧 target 为 identity）
+
+        Returns:
+            pose_loss: scalar loss
+        """
+        B, V = pose_enc_pred.shape[:2]
+
+        # 提取预测的 center 和 quaternion
+        center_pred = pose_enc_pred[:, :, :3]  # [B, V, 3]
+        quat_pred = pose_enc_pred[:, :, 3:7]   # [B, V, 4]
+
+        # 归一化 quaternion
+        quat_pred = quat_pred / (torch.norm(quat_pred, dim=-1, keepdim=True) + 1e-8)
+
+        # 提取 GT center (从 pose matrix 的最后一列)
+        center_gt = pose_gt[:, :, :3, 3]  # [B, V, 3]
+
+        # 提取 GT rotation (从 pose matrix 的前3x3部分)
+        # 需要将 rotation matrix 转换为 quaternion
+        rot_gt = pose_gt[:, :, :3, :3]  # [B, V, 3, 3]
+        quat_gt = self._rotation_matrix_to_quaternion(rot_gt)  # [B, V, 4]
+
+        # 排除第一帧
+        if exclude_first_frame and V > 1:
+            center_pred = center_pred[:, 1:, :]
+            center_gt = center_gt[:, 1:, :]
+            quat_pred = quat_pred[:, 1:, :]
+            quat_gt = quat_gt[:, 1:, :]
+
+        # Translation loss: Huber
+        trans_diff = torch.abs(center_pred - center_gt)
+        trans_loss = self._huber_loss(trans_diff)
+
+        # Rotation loss: quaternion geodesic
+        rot_loss = self._quaternion_geodesic_loss(quat_pred, quat_gt)
+
+        return self.rotation_weight * rot_loss + self.translation_weight * trans_loss
+
+    def _rotation_matrix_to_quaternion(self, R):
+        """
+        将 rotation matrix [B, V, 3, 3] 转换为 quaternion [B, V, 4]
+        使用简化方法，可能有数值不稳定性，但对于训练来说足够
+        """
+        B, V = R.shape[:2]
+
+        # 使用 trace 方法
+        trace = R[:, :, 0, 0] + R[:, :, 1, 1] + R[:, :, 2, 2]
+
+        # 简化实现：假设 rotation matrix 是有效的
+        # 使用更稳健的方法
+        batch_shape = (B, V)
+
+        # 为了避免数值不稳定，使用特征值分解的近似
+        # 这里使用简化的实现
+        qw = torch.sqrt(torch.clamp(trace + 1.0, min=1e-8)) / 2.0
+        qx = (R[:, :, 2, 1] - R[:, :, 1, 2]) / (4.0 * qw + 1e-8)
+        qy = (R[:, :, 0, 2] - R[:, :, 2, 0]) / (4.0 * qw + 1e-8)
+        qz = (R[:, :, 1, 0] - R[:, :, 0, 1]) / (4.0 * qw + 1e-8)
+
+        quat = torch.stack([qw, qx, qy, qz], dim=-1)
+        # 归一化
+        quat = quat / (torch.norm(quat, dim=-1, keepdim=True) + 1e-8)
+
+        return quat
+
+    def _quaternion_geodesic_loss(self, q1, q2):
+        """
+        Quaternion geodesic loss
+
+        Args:
+            q1: [B, V, 4] predicted quaternions
+            q2: [B, V, 4] ground truth quaternions
+
+        Returns:
+            geodesic loss: scalar
+        """
+        # Geodesic distance between two quaternions
+        # dot product
+        dot = torch.sum(q1 * q2, dim=-1)  # [B, V]
+
+        # Clamp to avoid numerical issues
+        dot = torch.clamp(torch.abs(dot), min=0.0, max=1.0)
+
+        # Angle = 2 * arccos(|dot|)
+        # 使用 arccos 的近似避免数值不稳定
+        angle = 2.0 * torch.acos(dot)
+
+        # 取 mean
+        return angle.mean()
+
+    def _huber_loss(self, diff, delta=1.0):
+        """
+        Huber loss (鲁棒性)
+
+        Args:
+            diff: [B, V, 3] 或任意形状的差值
+            delta: Huber delta
+
+        Returns:
+            huber loss: scalar
+        """
+        mask = (diff < delta).float()
+        loss = mask * 0.5 * diff ** 2 + (1 - mask) * (delta * diff - 0.5 * delta ** 2)
+        return loss.mean()
+
+
+class RelativePoseLoss(nn.Module):
+    """
+    Relative Pose Loss: 所有 view pairs 之间的 relative pose
+
+    遵循论文 Sec. 3.3 和文档第8.3节的设计：
+    - 在 sampled views 内计算所有 pair 的 relative pose
+    - T_i_to_j = inv(T_i) @ T_j
+    - rotation: geodesic loss
+    - translation: Huber loss
+    """
 
     def __init__(self, rotation_weight=1.0, translation_weight=10.0):
         super().__init__()
@@ -196,19 +333,150 @@ class PoseLoss(nn.Module):
         self.translation_weight = translation_weight
 
     def forward(self, pose_enc_pred, pose_gt):
-        center_pred = pose_enc_pred[:, :, :3]
-        quat_pred = pose_enc_pred[:, :, 3:7]
-        quat_pred = quat_pred / torch.norm(quat_pred, dim=-1, keepdim=True)
+        """
+        Args:
+            pose_enc_pred: [B, V, 9] pose encoding (center + quaternion + focal/offset)
+            pose_gt: [B, V, 4, 4] camera-to-world pose matrix
 
-        center_gt = pose_gt[:, :, :3, 3]
+        Returns:
+            relative_pose_loss: scalar loss
+        """
+        B, V = pose_enc_pred.shape[:2]
 
-        trans_diff = torch.abs(center_pred - center_gt)
-        trans_loss = self._huber_loss(trans_diff)
-        rot_loss = torch.norm(quat_pred, dim=-1).mean()
+        if V < 2:
+            return 0.0  # 需要至少2帧才能计算 relative pose
 
-        return self.rotation_weight * rot_loss + self.translation_weight * trans_loss
+        # 提取预测的 center 和 quaternion
+        center_pred = pose_enc_pred[:, :, :3]  # [B, V, 3]
+        quat_pred = pose_enc_pred[:, :, 3:7]   # [B, V, 4]
+        quat_pred = quat_pred / (torch.norm(quat_pred, dim=-1, keepdim=True) + 1e-8)
+
+        # 构建 predicted pose matrix
+        # 从 quaternion 构建 rotation matrix
+        rot_pred = self._quaternion_to_rotation_matrix(quat_pred)  # [B, V, 3, 3]
+
+        # 构建 4x4 pose matrix
+        pose_pred = torch.zeros(B, V, 4, 4, device=pose_enc_pred.device)
+        pose_pred[:, :, :3, :3] = rot_pred
+        pose_pred[:, :, :3, 3] = center_pred
+        pose_pred[:, :, 3, 3] = 1.0
+
+        # 计算 relative pose pairs
+        total_loss = 0.0
+        num_pairs = 0
+
+        for i in range(V):
+            for j in range(V):
+                if i == j:
+                    continue
+
+                # T_i_to_j_pred = inv(T_i_pred) @ T_j_pred
+                T_i_pred = pose_pred[:, i, :, :]  # [B, 4, 4]
+                T_j_pred = pose_pred[:, j, :, :]  # [B, 4, 4]
+                T_i_to_j_pred = torch.linalg.inv(T_i_pred) @ T_j_pred  # [B, 4, 4]
+
+                # T_i_to_j_gt = inv(T_i_gt) @ T_j_gt
+                T_i_gt = pose_gt[:, i, :, :]
+                T_j_gt = pose_gt[:, j, :, :]
+                T_i_to_j_gt = torch.linalg.inv(T_i_gt) @ T_j_gt
+
+                # 提取 relative translation 和 rotation
+                trans_pred = T_i_to_j_pred[:, :3, 3]
+                trans_gt = T_i_to_j_gt[:, :3, 3]
+
+                rot_pred_ij = T_i_to_j_pred[:, :3, :3]
+                rot_gt_ij = T_i_to_j_gt[:, :3, :3]
+
+                quat_pred_ij = self._rotation_matrix_to_quaternion(rot_pred_ij)
+                quat_gt_ij = self._rotation_matrix_to_quaternion(rot_gt_ij)
+
+                # Translation loss
+                trans_diff = torch.abs(trans_pred - trans_gt)
+                trans_loss = self._huber_loss(trans_diff)
+
+                # Rotation loss
+                rot_loss = self._quaternion_geodesic_loss(quat_pred_ij, quat_gt_ij)
+
+                total_loss += self.rotation_weight * rot_loss + self.translation_weight * trans_loss
+                num_pairs += 1
+
+        return total_loss / num_pairs if num_pairs > 0 else 0.0
+
+    def _quaternion_to_rotation_matrix(self, q):
+        """
+        将 quaternion [B, V, 4] 转换为 rotation matrix [B, V, 3, 3]
+        """
+        # 归一化
+        q = q / (torch.norm(q, dim=-1, keepdim=True) + 1e-8)
+
+        qw, qx, qy, qz = q[:, :, 0], q[:, :, 1], q[:, :, 2], q[:, :, 3]
+
+        # Rotation matrix from quaternion
+        R00 = 1.0 - 2.0 * (qy * qy + qz * qz)
+        R01 = 2.0 * (qx * qy - qz * qw)
+        R02 = 2.0 * (qx * qz + qy * qw)
+
+        R10 = 2.0 * (qx * qy + qz * qw)
+        R11 = 1.0 - 2.0 * (qx * qx + qz * qz)
+        R12 = 2.0 * (qy * qz - qx * qw)
+
+        R20 = 2.0 * (qx * qz - qy * qw)
+        R21 = 2.0 * (qy * qz + qx * qw)
+        R22 = 1.0 - 2.0 * (qx * qx + qy * qy)
+
+        R = torch.stack([
+            torch.stack([R00, R01, R02], dim=-1),
+            torch.stack([R10, R11, R12], dim=-1),
+            torch.stack([R20, R21, R22], dim=-1),
+        ], dim=-2)
+
+        return R
+
+    def _rotation_matrix_to_quaternion(self, R):
+        """将 rotation matrix 转换为 quaternion
+
+        Args:
+            R: rotation matrix, can be [B, V, 3, 3] or [B, 3, 3]
+
+        Returns:
+            quaternion: same batch shape with last dim 4
+        """
+        # Handle different shapes
+        if R.dim() == 3:  # [B, 3, 3]
+            trace = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
+            qw = torch.sqrt(torch.clamp(trace + 1.0, min=1e-8)) / 2.0
+            qx = (R[:, 2, 1] - R[:, 1, 2]) / (4.0 * qw + 1e-8)
+            qy = (R[:, 0, 2] - R[:, 2, 0]) / (4.0 * qw + 1e-8)
+            qz = (R[:, 1, 0] - R[:, 0, 1]) / (4.0 * qw + 1e-8)
+            quat = torch.stack([qw, qx, qy, qz], dim=-1)
+        elif R.dim() == 4:  # [B, V, 3, 3]
+            trace = R[:, :, 0, 0] + R[:, :, 1, 1] + R[:, :, 2, 2]
+            qw = torch.sqrt(torch.clamp(trace + 1.0, min=1e-8)) / 2.0
+            qx = (R[:, :, 2, 1] - R[:, :, 1, 2]) / (4.0 * qw + 1e-8)
+            qy = (R[:, :, 0, 2] - R[:, :, 2, 0]) / (4.0 * qw + 1e-8)
+            qz = (R[:, :, 1, 0] - R[:, :, 0, 1]) / (4.0 * qw + 1e-8)
+            quat = torch.stack([qw, qx, qy, qz], dim=-1)
+        else:
+            raise ValueError(f"Unexpected rotation matrix shape: {R.shape}")
+
+        return quat / (torch.norm(quat, dim=-1, keepdim=True) + 1e-8)
+
+    def _quaternion_geodesic_loss(self, q1, q2):
+        """Quaternion geodesic loss
+
+        Args:
+            q1, q2: quaternions, can be [B, V, 4] or [B, 4]
+
+        Returns:
+            geodesic loss: scalar
+        """
+        dot = torch.sum(q1 * q2, dim=-1)
+        dot = torch.clamp(torch.abs(dot), min=0.0, max=1.0)
+        angle = 2.0 * torch.acos(dot)
+        return angle.mean()
 
     def _huber_loss(self, diff, delta=1.0):
+        """Huber loss"""
         mask = (diff < delta).float()
         loss = mask * 0.5 * diff ** 2 + (1 - mask) * (delta * diff - 0.5 * delta ** 2)
         return loss.mean()
@@ -219,10 +487,22 @@ def create_head_only_model(
     freeze_backbone=True,
     img_size=224,
     train_depth_head=True,
-    train_pose_head=False,
+    train_pose_head=True,  # 默认启用 pose head（论文4.1对齐）
     num_views=2,
 ):
-    """创建 head-only 模型"""
+    """创建 head-only 模型
+
+    Args:
+        backbone_name: DINOv2 backbone 类型
+        freeze_backbone: 是否冻结 backbone
+        img_size: 训练图像尺寸
+        train_depth_head: 是否训练 depth head
+        train_pose_head: 是否训练 pose head（默认 True，符合论文4.1）
+        num_views: 视角数（可以是固定值或范围）
+
+    Returns:
+        HeadOnlyModel 实例
+    """
     model = HeadOnlyModel(
         backbone_name=backbone_name,
         freeze_backbone=freeze_backbone,

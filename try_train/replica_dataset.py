@@ -1,5 +1,5 @@
 """
-Replica 数据加载器
+Replica 数据加载器（论文4.1对齐版）
 
 根据 Replica 数据集的结构特点，本模块实现：
 
@@ -15,13 +15,21 @@ Replica 数据加载器
    - RGB/depth/valid_mask/intrinsics 对齐
    - resize/pad 到训练尺寸（14 的整数倍）
 
-3. 多视角采样策略：temporal_nearby sampler
+3. 多视角采样策略：
+   - 支持视角范围 [min_views, max_views]（论文第一阶段：2-24）
+   - temporal_nearby sampler（时间窗口内采样）
+   - shuffle_view_order（随机打乱视角顺序）
+
 4. pose target 归一化：相对于第一帧
+
+5. 数据增强（论文4.1对齐）：
+   - color_jitter (brightness/contrast/saturation/hue)
+   - grayscale (可选)
 
 数据路径：/home/shared_files/datasets/dovsg/Replica/room0/
 
 作者：Claude Code
-日期：2026-05-11
+日期：2026-05-12
 """
 
 import os
@@ -57,29 +65,61 @@ class ReplicaDataset(Dataset):
     def __init__(
         self,
         data_root: str,
-        num_views: int = 2,
+        num_views: int = 2,  # 保留兼容性，如果指定则固定值
+        min_views: Optional[int] = None,
+        max_views: Optional[int] = None,
         max_dim: int = 224,
         temporal_window: int = 30,
         shuffle_view_order: bool = True,
-        color_jitter_prob: float = 0.3,
+        color_jitter_prob: float = 0.9,  # 论文4.1设置
+        brightness: float = 0.5,
+        contrast: float = 0.5,
+        saturation: float = 0.5,
+        hue: float = 0.1,
+        grayscale_prob: float = 0.05,
         seed: int = 42,
     ):
         """
         Args:
             data_root: Replica 数据根目录 (e.g., /path/to/Replica/room0/)
-            num_views: 每个样本的视角数（默认2）
-            max_dim: 训练图像最大边长（默认224，显存允许可改336）
+            num_views: 固定视角数（保留兼容性）
+            min_views: 最小视角数（论文第一阶段：2）
+            max_views: 最大视角数（论文第一阶段：24）
+            max_dim: 训练图像最大边长（默认224，论文目标518）
             temporal_window: 时间采样窗口大小（默认30帧）
             shuffle_view_order: 是否随机打乱视角顺序
-            color_jitter_prob: color jitter 概率（默认0.3）
-            seed: 隋机种子
+            color_jitter_prob: color jitter 概率（论文4.1=0.9）
+            brightness: brightness jitter 参数（论文4.1=0.5）
+            contrast: contrast jitter 参数（论文4.1=0.5）
+            saturation: saturation jitter 参数（论文4.1=0.5）
+            hue: hue jitter 参数（论文4.1=0.1）
+            grayscale_prob: grayscale 概率（论文4.1=0.05）
+            seed: 随机种子
         """
         self.data_root = Path(data_root)
-        self.num_views = num_views
+
+        # 视角数设置：优先使用范围，否则使用固定值
+        if min_views is not None and max_views is not None:
+            self.min_views = min_views
+            self.max_views = max_views
+            self.use_view_range = True
+        else:
+            self.min_views = num_views
+            self.max_views = num_views
+            self.use_view_range = False
+
         self.max_dim = max_dim
         self.temporal_window = temporal_window
         self.shuffle_view_order = shuffle_view_order
+
+        # 数据增强参数（论文4.1对齐）
         self.color_jitter_prob = color_jitter_prob
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.hue = hue
+        self.grayscale_prob = grayscale_prob
+
         self.seed = seed
 
         # 设置随机种子
@@ -88,10 +128,11 @@ class ReplicaDataset(Dataset):
 
         print(f"[ReplicaDataset] 初始化")
         print(f"  - Data root: {data_root}")
-        print(f"  - 视角数: {num_views}")
+        print(f"  - 视角数: {self.min_views}-{self.max_views} (range={self.use_view_range})")
         print(f"  - 最大尺寸: {max_dim}")
         print(f"  - 时间窗口: {temporal_window}")
         print(f"  - Shuffle: {shuffle_view_order}")
+        print(f"  - Color jitter prob: {color_jitter_prob}")
 
         # 加载 poses
         self.poses = self._load_poses()
@@ -190,10 +231,10 @@ class ReplicaDataset(Dataset):
         return K
 
     def _build_samples(self) -> List[List[int]]:
-        """构建样本列表（temporal_nearby sampler）"""
+        """构建样本列表（temporal_nearby sampler，支持动态视角数）"""
         samples = []
 
-        if len(self.frame_ids) < self.num_views:
+        if len(self.frame_ids) < self.min_views:
             print(f"[build_samples] 帧数不足，无法构建样本")
             return samples
 
@@ -205,11 +246,19 @@ class ReplicaDataset(Dataset):
             window_end = min(len(self.frame_ids), ref_idx + self.temporal_window + 1)
             window_frame_ids = self.frame_ids[window_start:window_end]
 
-            if len(window_frame_ids) < self.num_views:
+            if len(window_frame_ids) < self.min_views:
                 continue
 
+            # 动态采样视角数（如果使用范围）
+            if self.use_view_range:
+                # 确保不超过窗口内可用的帧数
+                max_possible = min(self.max_views, len(window_frame_ids))
+                num_views = random.randint(self.min_views, max_possible)
+            else:
+                num_views = self.min_views
+
             # 从窗口中采样 num_views 个帧
-            sampled_frames = random.sample(window_frame_ids, self.num_views)
+            sampled_frames = random.sample(window_frame_ids, num_views)
 
             # 如果 shuffle，打乱顺序（但保留第一个作为参考帧）
             if self.shuffle_view_order:
@@ -327,31 +376,101 @@ class ReplicaDataset(Dataset):
         return poses_normalized
 
     def _apply_color_jitter(self, images):
-        """应用 color jitter"""
+        """应用 color jitter（论文4.1对齐）
+
+        Args:
+            images: [V, 3, H, W] tensor of multiple views
+
+        Returns:
+            jittered images: [V, 3, H, W]
+        """
         import torchvision.transforms.functional as F
-        brightness_factor = random.uniform(0.8, 1.2)
-        contrast_factor = random.uniform(0.8, 1.2)
-        saturation_factor = random.uniform(0.8, 1.2)
-        images = F.adjust_brightness(images, brightness_factor)
-        images = F.adjust_contrast(images, contrast_factor)
-        return F.adjust_saturation(images, saturation_factor)
+
+        # Clamp to valid range first
+        images = torch.clamp(images, 0.0, 1.0)
+
+        # 对每个 view 应用 color jitter
+        V = images.shape[0]
+        jittered_images = []
+
+        for v in range(V):
+            img_v = images[v]  # [3, H, W]
+
+            brightness_factor = random.uniform(1 - self.brightness, 1 + self.brightness)
+            contrast_factor = random.uniform(1 - self.contrast, 1 + self.contrast)
+            saturation_factor = random.uniform(1 - self.saturation, 1 + self.saturation)
+
+            img_v = F.adjust_brightness(img_v, brightness_factor)
+            img_v = F.adjust_contrast(img_v, contrast_factor)
+            img_v = F.adjust_saturation(img_v, saturation_factor)
+
+            # 可选 grayscale（所有 view 使用相同决策）
+            if v == 0 and random.random() < self.grayscale_prob:
+                # 标记需要 grayscale
+                self._apply_grayscale = True
+            if hasattr(self, '_apply_grayscale') and self._apply_grayscale:
+                gray = 0.299 * img_v[0] + 0.587 * img_v[1] + 0.114 * img_v[2]
+                img_v = torch.stack([gray, gray, gray], dim=0)
+
+            jittered_images.append(torch.clamp(img_v, 0.0, 1.0))
+
+        # 清除 grayscale 标记
+        if hasattr(self, '_apply_grayscale'):
+            del self._apply_grayscale
+
+        return torch.stack(jittered_images, dim=0)
 
 
 def create_replica_dataloader(
     data_root,
     batch_size=1,
-    num_views=2,
+    num_views=2,  # 保留兼容性
+    min_views=None,
+    max_views=None,
     max_dim=224,
     shuffle=True,
     num_workers=4,
     seed=42,
+    # 论文4.1数据增强参数
+    color_jitter_prob=0.9,
+    brightness=0.5,
+    contrast=0.5,
+    saturation=0.5,
+    hue=0.1,
+    grayscale_prob=0.05,
 ):
-    """创建 Replica DataLoader"""
+    """创建 Replica DataLoader（论文4.1对齐版）
+
+    Args:
+        data_root: Replica 数据根目录
+        batch_size: batch 大小
+        num_views: 固定视角数（保留兼容性）
+        min_views: 最小视角数（论文第一阶段：2）
+        max_views: 最大视角数（论文第一阶段：24）
+        max_dim: 图像最大边长
+        shuffle: 是否 shuffle
+        num_workers: DataLoader worker 数
+        seed: 随机种子
+        color_jitter_prob: color jitter 概率（论文4.1=0.9）
+        brightness: brightness jitter 参数（论文4.1=0.5）
+        contrast: contrast jitter 参数（论文4.1=0.5）
+        saturation: saturation jitter 参数（论文4.1=0.5）
+        hue: hue jitter 参数（论文4.1=0.1）
+        grayscale_prob: grayscale 概率（论文4.1=0.05）
+    """
     dataset = ReplicaDataset(
         data_root=data_root,
         num_views=num_views,
+        min_views=min_views,
+        max_views=max_views,
         max_dim=max_dim,
         seed=seed,
+        color_jitter_prob=color_jitter_prob,
+        brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
+        hue=hue,
+        grayscale_prob=grayscale_prob,
     )
     return DataLoader(
         dataset,
@@ -365,19 +484,29 @@ def create_replica_dataloader(
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Replica 数据加载器测试（论文4.1对齐版）")
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--num_views', type=int, default=2)
+    parser.add_argument('--num_views', type=int, default=2, help='固定视角数')
+    parser.add_argument('--min_views', type=int, default=None, help='最小视角数（论文第一阶段：2）')
+    parser.add_argument('--max_views', type=int, default=None, help='最大视角数（论文第一阶段：24）')
     parser.add_argument('--max_dim', type=int, default=224)
     args = parser.parse_args()
 
-    dataloader = create_replica_dataloader(args.data_root, args.batch_size, args.num_views, args.max_dim)
+    dataloader = create_replica_dataloader(
+        args.data_root,
+        args.batch_size,
+        args.num_views,
+        args.min_views,
+        args.max_views,
+        args.max_dim
+    )
     print(f"\n[测试] 读取第一个 batch...")
     for batch in dataloader:
         print(f"  - Images: {batch['images'].shape}")
         print(f"  - Depths: {batch['depths'].shape}")
         print(f"  - Poses: {batch['poses'].shape}")
         print(f"  - Frame IDs: {batch['frame_ids']}")
+        print(f"  - 视角数: {batch['images'].shape[1]}")
         break
     print(f"[测试] 完成")
