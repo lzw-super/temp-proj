@@ -159,36 +159,43 @@ def validate_model_v2(model, dataset, device='cuda', num_samples=5):
 
 
 def visualize_results_v2(results, output_dir):
-    """可视化深度和位姿预测结果"""
+    """可视化深度和位姿预测结果（使用灰度colormap）"""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 计算GT深度的最大值用于统一可视化范围
+    gt_max = max([r['gt_max'] for r in results[:5]])
+    vmax = max(gt_max, 10)  # 至少10m的范围
 
     for idx, result in enumerate(results[:5]):  # 只可视化前5个
         depth_pred = result['depth_pred']
         depth_gt = result['depth_gt']
         valid_mask = result['valid_mask']
 
-        # 创建对比图
+        # 创建对比图（使用灰度colormap）
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-        # 预测深度
+        # 预测深度（灰度）
         pred_vis = np.ma.masked_where(~valid_mask, depth_pred)
-        axes[0].imshow(pred_vis, cmap='viridis', vmin=0, vmax=10)
+        im_pred = axes[0].imshow(pred_vis, cmap='gray', vmin=0, vmax=vmax)
         axes[0].set_title(f'Predicted Depth\n(range: {result["pred_min"]:.2f}-{result["pred_max"]:.2f}m)')
         axes[0].axis('off')
+        plt.colorbar(im_pred, ax=axes[0], fraction=0.046, pad=0.04)
 
-        # GT深度
+        # GT深度（灰度）
         gt_vis = np.ma.masked_where(~valid_mask, depth_gt)
-        axes[1].imshow(gt_vis, cmap='viridis', vmin=0, vmax=10)
+        im_gt = axes[1].imshow(gt_vis, cmap='gray', vmin=0, vmax=vmax)
         axes[1].set_title(f'GT Depth\n(range: {result["gt_min"]:.2f}-{result["gt_max"]:.2f}m)')
         axes[1].axis('off')
+        plt.colorbar(im_gt, ax=axes[1], fraction=0.046, pad=0.04)
 
-        # 误差图
+        # 误差图（保持hot colormap，因为是误差图）
         error = np.abs(depth_pred - depth_gt)
         error_vis = np.ma.masked_where(~valid_mask, error)
-        axes[2].imshow(error_vis, cmap='hot', vmin=0, vmax=2)
+        im_err = axes[2].imshow(error_vis, cmap='hot', vmin=0, vmax=2)
         axes[2].set_title(f'Absolute Error\n(rel_error: {result["mean_rel_error"]:.3f})')
         axes[2].axis('off')
+        plt.colorbar(im_err, ax=axes[2], fraction=0.046, pad=0.04)
 
         plt.tight_layout()
         save_path = output_dir / f'depth_comparison_v2_{idx}.png'

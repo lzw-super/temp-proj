@@ -20,4 +20,6 @@ example/office2
 video_data/
 video_data_* 
 *.png
-*.pt
+*.pt 
+checkpoints
+comparison_results
