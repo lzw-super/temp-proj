@@ -24,6 +24,10 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from lingbot_map.models.gct_stream import GCTStream
+from lingbot_map.utils.load_fn import load_and_preprocess_images
 
 from foldback_video_sampler import FoldbackVideoSampler
 from head_only_model import create_head_only_model
@@ -44,6 +48,56 @@ def create_depth_colormap():
         (1.0, 1.0, 1.0),   # 远处：白
     ]
     return LinearSegmentedColormap.from_list('depth_gray', colors)
+
+
+def load_original_model(model_path, device='cuda'):
+    """加载原始LingBot-Map模型"""
+    model = GCTStream(
+        img_size=518, patch_size=14, enable_3d_rope=True,
+        max_frame_num=100, kv_cache_sliding_window=64,
+        kv_cache_scale_frames=8, kv_cache_cross_frame_special=True,
+        kv_cache_include_scale_frames=True, use_sdpa=True,
+    )
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    state_dict = ckpt.get("model", ckpt)
+    model.load_state_dict(state_dict, strict=False)
+    model = model.to(device).eval()
+    print(f"[Original Model] Loaded from {model_path}")
+    return model
+
+
+def infer_original_model(model, image_paths, device='cuda'):
+    """用原始模型推理（518分辨率，streaming模式）"""
+    images = load_and_preprocess_images(image_paths, mode="crop", image_size=518, patch_size=14)
+    images = images.unsqueeze(0).to(device)
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+        predictions = model.inference_streaming(images, num_scale_frames=8)
+    depth_pred = predictions['depth']
+    if depth_pred.dim() == 5:
+        depth_pred = depth_pred.squeeze(-1)
+    return depth_pred[0].cpu().float().numpy()  # [S, H, W]
+
+
+def resize_depth_to_gt(depth_pred, gt_shape):
+    """将预测深度resize到GT分辨率"""
+    if depth_pred.shape == gt_shape:
+        return depth_pred
+    return cv2.resize(depth_pred, (gt_shape[1], gt_shape[0]), interpolation=cv2.INTER_LINEAR)
+
+
+def align_depth_scale(pred, gt, mask):
+    """使用最小二乘法将预测深度对齐到GT的尺度 (scale * pred + shift = gt)"""
+    pred_valid = pred[mask]
+    gt_valid = gt[mask]
+    if len(pred_valid) < 10:
+        return pred
+    A = np.column_stack([pred_valid, np.ones_like(pred_valid)])
+    result = np.linalg.lstsq(A, gt_valid, rcond=None)
+    scale, shift = result[0][0], result[0][1]
+    aligned = scale * pred + shift
+    aligned = np.maximum(aligned, 0)
+    return aligned
 
 
 def load_poses(data_root):
@@ -156,13 +210,13 @@ def load_model_and_infer(checkpoint_path, images, device='cuda'):
 
 
 def validate_long_sequence(
-    stage1_checkpoint, stage2_checkpoint, data_root,
+    stage1_checkpoint, stage2_checkpoint, original_model, data_root,
     num_views=8, num_samples=5, max_dim=224, device='cuda'
 ):
-    """长序列验证"""
+    """长序列验证（含原始模型对比）"""
 
     print(f"\n{'='*70}")
-    print(f"长序列验证 (num_views={num_views})")
+    print(f"长序列验证 (num_views={num_views}, 含原始模型对比)")
     print(f"{'='*70}")
 
     # 加载poses
@@ -179,6 +233,7 @@ def validate_long_sequence(
 
     results_stage1 = []
     results_stage2 = []
+    results_orig = []
     results_gt = []
 
     for sample_idx in range(num_samples):
@@ -227,6 +282,11 @@ def validate_long_sequence(
             depth_pred_s2 = depth_pred_s2.squeeze(-1)
         depth_pred_s2_np = depth_pred_s2[0].cpu().numpy()  # [V, H, W]
 
+        # 原始模型推理（518分辨率）
+        image_paths = [str(Path(data_root) / "results" / f"frame{fid:06d}.jpg") for fid in frame_ids]
+        print("  原始模型推理中...")
+        depth_pred_orig = infer_original_model(original_model, image_paths, device)
+
         # 计算每帧的误差
         for v in range(num_views):
             gt_v = depths_gt[v]
@@ -243,6 +303,12 @@ def validate_long_sequence(
                 # 深度误差
                 rel_error_s1 = np.abs(pred_s1_valid - gt_valid) / (gt_valid + 1e-3)
                 rel_error_s2 = np.abs(pred_s2_valid - gt_valid) / (gt_valid + 1e-3)
+
+                # 原始模型深度：resize到GT分辨率并做尺度对齐
+                orig_v = resize_depth_to_gt(depth_pred_orig[v], gt_v.shape)
+                orig_v = align_depth_scale(orig_v, gt_v, mask_v)
+                orig_valid = orig_v[mask_v]
+                rel_error_orig = np.abs(orig_valid - gt_valid) / (gt_valid + 1e-3)
 
                 # 位姿误差
                 pose_gt_v = poses_gt[v]
@@ -302,6 +368,16 @@ def validate_long_sequence(
                     'valid_mask': mask_v,
                 })
 
+                results_orig.append({
+                    'sample_idx': sample_idx,
+                    'view_idx': v,
+                    'frame_id': frame_ids[v],
+                    'depth_rel_error': rel_error_orig.mean(),
+                    'depth_pred': orig_v,
+                    'depth_gt': gt_v,
+                    'valid_mask': mask_v,
+                })
+
                 results_gt.append({
                     'sample_idx': sample_idx,
                     'view_idx': v,
@@ -310,17 +386,17 @@ def validate_long_sequence(
                     'valid_mask': mask_v,
                 })
 
-                print(f"  View {v}: Depth误差 S1={rel_error_s1.mean():.3f}, S2={rel_error_s2.mean():.3f}")
+                print(f"  View {v}: Depth误差 Orig={rel_error_orig.mean():.3f}, S1={rel_error_s1.mean():.3f}, S2={rel_error_s2.mean():.3f}")
                 if rot_error_s1 is not None:
                     print(f"    Pose: Rot S1={rot_error_s1:.2f}°, S2={rot_error_s2:.2f}° | Trans S1={trans_error_s1:.3f}m, S2={trans_error_s2:.3f}m")
 
-    return results_stage1, results_stage2, results_gt, iter_s1, iter_s2
+    return results_stage1, results_stage2, results_orig, results_gt, iter_s1, iter_s2
 
 
 def visualize_long_sequence_comparison(
-    results_stage1, results_stage2, results_gt, output_dir, num_views
+    results_stage1, results_stage2, results_orig, results_gt, output_dir, num_views
 ):
-    """生成长序列可视化对比（使用灰度深度图）"""
+    """生成长序列可视化对比（4行：GT / Original / Stage1 / Stage2）"""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -330,43 +406,64 @@ def visualize_long_sequence_comparison(
 
     num_display = min(8, len(views_in_sample))  # 最多显示8帧
 
-    # 创建大图：每帧3行（GT、Stage1、Stage2）
-    fig, axes = plt.subplots(3, num_display, figsize=(4 * num_display, 12))
+    # 创建大图：每帧4行（GT、Original、Stage1、Stage2）
+    fig, axes = plt.subplots(4, num_display, figsize=(4 * num_display, 16))
 
     if num_display == 1:
-        axes = axes.reshape(3, 1)
+        axes = axes.reshape(4, 1)
+
+    row_labels = ['GT Depth', 'Original LingBot-Map', 'Stage1 (Head-Only)', 'Stage2 (Streaming)']
 
     for v_idx in range(num_display):
         result_s1 = views_in_sample[v_idx]
         result_s2 = [r for r in results_stage2 if r['sample_idx'] == sample_idx and r['view_idx'] == result_s1['view_idx']][0]
+        result_orig = [r for r in results_orig if r['sample_idx'] == sample_idx and r['view_idx'] == result_s1['view_idx']][0]
         result_gt = [r for r in results_gt if r['sample_idx'] == sample_idx and r['view_idx'] == result_s1['view_idx']][0]
 
         depth_gt = result_gt['depth_gt']
+        depth_pred_orig = result_orig['depth_pred']
         depth_pred_s1 = result_s1['depth_pred']
         depth_pred_s2 = result_s2['depth_pred']
         valid_mask = result_gt['valid_mask']
 
-        # GT深度（灰度）
-        gt_vis = np.ma.masked_where(~valid_mask, depth_gt)
         gt_max = np.max(depth_gt[valid_mask]) if np.any(valid_mask) else 10
-        im_gt = axes[0, v_idx].imshow(gt_vis, cmap='gray', vmin=0, vmax=max(gt_max, 5))
+        vmax = max(gt_max, 5)
+
+        # GT深度
+        gt_vis = np.ma.masked_where(~valid_mask, depth_gt)
+        im_gt = axes[0, v_idx].imshow(gt_vis, cmap='gray', vmin=0, vmax=vmax)
         axes[0, v_idx].set_title(f'GT Frame {result_gt["frame_id"]}')
         axes[0, v_idx].axis('off')
-        plt.colorbar(im_gt, ax=axes[0, v_idx], fraction=0.046, pad=0.04, label='Depth (m)')
+        if v_idx == num_display - 1:
+            plt.colorbar(im_gt, ax=axes[0, v_idx], fraction=0.046, pad=0.04, label='m')
 
-        # Stage1预测（灰度）
-        pred_s1_vis = np.ma.masked_where(~valid_mask, depth_pred_s1)
-        im_s1 = axes[1, v_idx].imshow(pred_s1_vis, cmap='gray', vmin=0, vmax=max(gt_max, 5))
-        axes[1, v_idx].set_title(f'Stage1 Pred\n(rel_err: {result_s1["depth_rel_error"]:.3f})')
+        # Original LingBot-Map
+        orig_vis = np.ma.masked_where(~valid_mask, depth_pred_orig)
+        im_orig = axes[1, v_idx].imshow(orig_vis, cmap='gray', vmin=0, vmax=vmax)
+        axes[1, v_idx].set_title(f'Original\n(rel_err: {result_orig["depth_rel_error"]:.3f})')
         axes[1, v_idx].axis('off')
-        plt.colorbar(im_s1, ax=axes[1, v_idx], fraction=0.046, pad=0.04, label='Depth (m)')
+        if v_idx == num_display - 1:
+            plt.colorbar(im_orig, ax=axes[1, v_idx], fraction=0.046, pad=0.04, label='m')
 
-        # Stage2预测（灰度）
-        pred_s2_vis = np.ma.masked_where(~valid_mask, depth_pred_s2)
-        im_s2 = axes[2, v_idx].imshow(pred_s2_vis, cmap='gray', vmin=0, vmax=max(gt_max, 5))
-        axes[2, v_idx].set_title(f'Stage2 Pred\n(rel_err: {result_s2["depth_rel_error"]:.3f})')
+        # Stage1预测
+        pred_s1_vis = np.ma.masked_where(~valid_mask, depth_pred_s1)
+        im_s1 = axes[2, v_idx].imshow(pred_s1_vis, cmap='gray', vmin=0, vmax=vmax)
+        axes[2, v_idx].set_title(f'Stage1\n(rel_err: {result_s1["depth_rel_error"]:.3f})')
         axes[2, v_idx].axis('off')
-        plt.colorbar(im_s2, ax=axes[2, v_idx], fraction=0.046, pad=0.04, label='Depth (m)')
+        if v_idx == num_display - 1:
+            plt.colorbar(im_s1, ax=axes[2, v_idx], fraction=0.046, pad=0.04, label='m')
+
+        # Stage2预测
+        pred_s2_vis = np.ma.masked_where(~valid_mask, depth_pred_s2)
+        im_s2 = axes[3, v_idx].imshow(pred_s2_vis, cmap='gray', vmin=0, vmax=vmax)
+        axes[3, v_idx].set_title(f'Stage2\n(rel_err: {result_s2["depth_rel_error"]:.3f})')
+        axes[3, v_idx].axis('off')
+        if v_idx == num_display - 1:
+            plt.colorbar(im_s2, ax=axes[3, v_idx], fraction=0.046, pad=0.04, label='m')
+
+    # 添加行标签
+    for row, label in enumerate(row_labels):
+        axes[row, 0].set_ylabel(label, fontsize=10, rotation=0, labelpad=80, ha='right', va='center')
 
     plt.suptitle(f'长序列深度对比 ({num_views} views)', fontsize=14)
     plt.tight_layout()
@@ -380,23 +477,26 @@ def visualize_long_sequence_comparison(
 
     depth_errors_s1 = [r['depth_rel_error'] for r in results_stage1]
     depth_errors_s2 = [r['depth_rel_error'] for r in results_stage2]
+    depth_errors_orig = [r['depth_rel_error'] for r in results_orig]
 
     # 深度误差分布
-    axes[0, 0].hist(depth_errors_s1, bins=30, alpha=0.7, label='Stage1', color='blue', edgecolor='black')
-    axes[0, 0].hist(depth_errors_s2, bins=30, alpha=0.7, label='Stage2', color='green', edgecolor='black')
+    axes[0, 0].hist(depth_errors_orig, bins=30, alpha=0.5, label=f'Original (mean={np.mean(depth_errors_orig):.3f})', color='red', edgecolor='black')
+    axes[0, 0].hist(depth_errors_s1, bins=30, alpha=0.5, label=f'Stage1 (mean={np.mean(depth_errors_s1):.3f})', color='blue', edgecolor='black')
+    axes[0, 0].hist(depth_errors_s2, bins=30, alpha=0.5, label=f'Stage2 (mean={np.mean(depth_errors_s2):.3f})', color='green', edgecolor='black')
     axes[0, 0].set_xlabel('Depth Relative Error')
     axes[0, 0].set_ylabel('Count')
-    axes[0, 0].set_title(f'Depth Error Distribution (Mean: S1={np.mean(depth_errors_s1):.3f}, S2={np.mean(depth_errors_s2):.3f})')
-    axes[0, 0].legend()
+    axes[0, 0].set_title('Depth Error Distribution')
+    axes[0, 0].legend(fontsize=8)
 
     # 深度误差随帧变化
     view_indices = [r['view_idx'] for r in results_stage1]
+    axes[0, 1].scatter(view_indices, depth_errors_orig, alpha=0.4, label='Original', color='red')
     axes[0, 1].scatter(view_indices, depth_errors_s1, alpha=0.5, label='Stage1', color='blue')
     axes[0, 1].scatter(view_indices, depth_errors_s2, alpha=0.5, label='Stage2', color='green')
     axes[0, 1].set_xlabel('View Index in Sequence')
     axes[0, 1].set_ylabel('Depth Relative Error')
     axes[0, 1].set_title('Depth Error vs Sequence Position')
-    axes[0, 1].legend()
+    axes[0, 1].legend(fontsize=8)
 
     # 位姿误差
     pose_s1 = [r for r in results_stage1 if r['rot_error_deg'] is not None]
@@ -430,57 +530,63 @@ def visualize_long_sequence_comparison(
     plt.close()
     print(f"[visualize] Saved: {save_path}")
 
-    # 创建单帧详细对比（选取中间帧）
+    # 创建单帧详细对比（选取中间帧，4列：GT / Original / Stage1 / Stage2）
     mid_frame_idx = num_views // 2
     result_s1 = [r for r in results_stage1 if r['view_idx'] == mid_frame_idx][0]
     result_s2 = [r for r in results_stage2 if r['view_idx'] == mid_frame_idx][0]
+    result_orig = [r for r in results_orig if r['view_idx'] == mid_frame_idx][0]
 
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
 
     depth_gt = result_s1['depth_gt']
+    depth_pred_orig = result_orig['depth_pred']
     depth_pred_s1 = result_s1['depth_pred']
     depth_pred_s2 = result_s2['depth_pred']
     valid_mask = result_s1['valid_mask']
 
     gt_max = np.max(depth_gt[valid_mask]) if np.any(valid_mask) else 10
 
-    # 第一行：深度图（灰度）
+    # 第一行：4个深度图（灰度）
     im0 = axes[0, 0].imshow(np.ma.masked_where(~valid_mask, depth_gt), cmap='gray', vmin=0, vmax=gt_max)
-    axes[0, 0].set_title('GT Depth (Gray)')
+    axes[0, 0].set_title('GT Depth')
     plt.colorbar(im0, ax=axes[0, 0], fraction=0.046)
 
-    im1 = axes[0, 1].imshow(np.ma.masked_where(~valid_mask, depth_pred_s1), cmap='gray', vmin=0, vmax=gt_max)
-    axes[0, 1].set_title(f'Stage1 Depth (Gray)\nrel_err={result_s1["depth_rel_error"]:.3f}')
+    im1 = axes[0, 1].imshow(np.ma.masked_where(~valid_mask, depth_pred_orig), cmap='gray', vmin=0, vmax=gt_max)
+    axes[0, 1].set_title(f'Original LingBot-Map\nrel_err={result_orig["depth_rel_error"]:.3f}')
     plt.colorbar(im1, ax=axes[0, 1], fraction=0.046)
 
-    im2 = axes[0, 2].imshow(np.ma.masked_where(~valid_mask, depth_pred_s2), cmap='gray', vmin=0, vmax=gt_max)
-    axes[0, 2].set_title(f'Stage2 Depth (Gray)\nrel_err={result_s2["depth_rel_error"]:.3f}')
+    im2 = axes[0, 2].imshow(np.ma.masked_where(~valid_mask, depth_pred_s1), cmap='gray', vmin=0, vmax=gt_max)
+    axes[0, 2].set_title(f'Stage1 Depth\nrel_err={result_s1["depth_rel_error"]:.3f}')
     plt.colorbar(im2, ax=axes[0, 2], fraction=0.046)
 
-    # 误差图（热力图）
+    im3 = axes[0, 3].imshow(np.ma.masked_where(~valid_mask, depth_pred_s2), cmap='gray', vmin=0, vmax=gt_max)
+    axes[0, 3].set_title(f'Stage2 Depth\nrel_err={result_s2["depth_rel_error"]:.3f}')
+    plt.colorbar(im3, ax=axes[0, 3], fraction=0.046)
+
+    # 第二行：3个误差图 + 误差对比柱状图
+    error_orig = np.abs(depth_pred_orig - depth_gt)
     error_s1 = np.abs(depth_pred_s1 - depth_gt)
     error_s2 = np.abs(depth_pred_s2 - depth_gt)
-    axes[0, 3].imshow(np.ma.masked_where(~valid_mask, error_s2), cmap='hot', vmin=0, vmax=2)
-    axes[0, 3].set_title('Stage2 Absolute Error')
 
-    # 第二行：传统深度可视化（便于对比）
-    im5 = axes[1, 0].imshow(np.ma.masked_where(~valid_mask, depth_gt), cmap='jet', vmin=0, vmax=gt_max)
-    axes[1, 0].set_title('GT Depth (Jet)')
-    plt.colorbar(im5, ax=axes[1, 0], fraction=0.046)
+    axes[1, 0].imshow(np.ma.masked_where(~valid_mask, error_orig), cmap='hot', vmin=0, vmax=2)
+    axes[1, 0].set_title('Original Abs Error')
 
-    im6 = axes[1, 1].imshow(np.ma.masked_where(~valid_mask, depth_pred_s1), cmap='jet', vmin=0, vmax=gt_max)
-    axes[1, 1].set_title('Stage1 Depth (Jet)')
-    plt.colorbar(im6, ax=axes[1, 1], fraction=0.046)
+    axes[1, 1].imshow(np.ma.masked_where(~valid_mask, error_s1), cmap='hot', vmin=0, vmax=2)
+    axes[1, 1].set_title('Stage1 Abs Error')
 
-    im7 = axes[1, 2].imshow(np.ma.masked_where(~valid_mask, depth_pred_s2), cmap='jet', vmin=0, vmax=gt_max)
-    axes[1, 2].set_title('Stage2 Depth (Jet)')
-    plt.colorbar(im7, ax=axes[1, 2], fraction=0.046)
+    axes[1, 2].imshow(np.ma.masked_where(~valid_mask, error_s2), cmap='hot', vmin=0, vmax=2)
+    axes[1, 2].set_title('Stage2 Abs Error')
 
-    # S1 vs S2误差对比
-    diff = error_s2 - error_s1  # 正值表示S2更差
-    axes[1, 3].imshow(np.ma.masked_where(~valid_mask, diff), cmap='RdBu', vmin=-1, vmax=1)
-    axes[1, 3].set_title('S2 Error - S1 Error\n(Red: S2 worse, Blue: S2 better)')
+    # 误差对比柱状图
+    models = ['Original', 'Stage1', 'Stage2']
+    means = [result_orig['depth_rel_error'], result_s1['depth_rel_error'], result_s2['depth_rel_error']]
+    colors = ['red', 'blue', 'green']
+    axes[1, 3].bar(models, means, color=colors, alpha=0.7, edgecolor='black')
+    axes[1, 3].set_ylabel('Depth Relative Error')
+    for j, m in enumerate(means):
+        axes[1, 3].text(j, m + 0.01, f'{m:.3f}', ha='center', fontsize=10)
 
+    plt.suptitle(f'Single Frame Detail (view {mid_frame_idx})', fontsize=12)
     plt.tight_layout()
     save_path = output_dir / f'single_frame_detailed_comparison_view{mid_frame_idx}.png'
     plt.savefig(save_path, dpi=150)
@@ -488,27 +594,29 @@ def visualize_long_sequence_comparison(
     print(f"[visualize] Saved: {save_path}")
 
 
-def print_comparison_summary(results_stage1, results_stage2, iter_s1, iter_s2, num_views):
+def print_comparison_summary(results_stage1, results_stage2, results_orig, iter_s1, iter_s2, num_views):
     """打印对比总结"""
     depth_errors_s1 = [r['depth_rel_error'] for r in results_stage1]
     depth_errors_s2 = [r['depth_rel_error'] for r in results_stage2]
+    depth_errors_orig = [r['depth_rel_error'] for r in results_orig]
 
     pose_s1 = [r for r in results_stage1 if r['rot_error_deg'] is not None]
     pose_s2 = [r for r in results_stage2 if r['rot_error_deg'] is not None]
 
-    print(f"\n{'='*70}")
-    print(f"长序列验证结果汇总 ({num_views} views)")
-    print(f"{'='*70}")
-    print(f"{'指标':<35} {'Stage1':<20} {'Stage2':<20}")
-    print(f"{'-'*70}")
-    print(f"{'训练 Iterations':<35} {iter_s1:<20} {iter_s2:<20}")
-    print(f"{'验证样本数':<35} {len(depth_errors_s1):<20} {len(depth_errors_s2):<20}")
-    print(f"{'-'*70}")
+    print(f"\n{'='*80}")
+    print(f"长序列验证结果汇总 ({num_views} views, 含原始模型对比)")
+    print(f"{'='*80}")
+    print(f"{'指标':<35} {'Original':<15} {'Stage1':<15} {'Stage2':<15}")
+    print(f"{'-'*80}")
+    print(f"{'训练 Iterations':<35} {'N/A':<15} {iter_s1:<15} {iter_s2:<15}")
+    print(f"{'验证样本数':<35} {len(depth_errors_orig):<15} {len(depth_errors_s1):<15} {len(depth_errors_s2):<15}")
+    print(f"{'-'*80}")
 
-    print(f"{'Depth相对误差 (Mean)':<35} {np.mean(depth_errors_s1):.4f}              {np.mean(depth_errors_s2):.4f}")
-    print(f"{'Depth相对误差':<35} {np.std(depth_errors_s1):.4f}              {np.std(depth_errors_s2):.4f}")
-    print(f"{'Depth相对误差':<35} {np.min(depth_errors_s1):.4f}              {np.min(depth_errors_s2):.4f}")
-    print(f"{'Depth相对误差':<35} {np.max(depth_errors_s1):.4f}              {np.max(depth_errors_s2):.4f}")
+    print(f"{'Depth相对误差 (Mean)':<35} {np.mean(depth_errors_orig):.4f}         {np.mean(depth_errors_s1):.4f}         {np.mean(depth_errors_s2):.4f}")
+    print(f"{'Depth相对误差 (Std)':<35} {np.std(depth_errors_orig):.4f}         {np.std(depth_errors_s1):.4f}         {np.std(depth_errors_s2):.4f}")
+    print(f"{'Depth相对误差 (Min)':<35} {np.min(depth_errors_orig):.4f}         {np.min(depth_errors_s1):.4f}         {np.min(depth_errors_s2):.4f}")
+    print(f"{'Depth相对误差 (Max)':<35} {np.max(depth_errors_orig):.4f}         {np.max(depth_errors_s1):.4f}         {np.max(depth_errors_s2):.4f}")
+    print(f"{'='*80}")
 
     if pose_s1 and pose_s2:
         rot_s1 = [r['rot_error_deg'] for r in pose_s1]
@@ -526,9 +634,13 @@ def print_comparison_summary(results_stage1, results_stage2, iter_s1, iter_s2, n
     print(f"{'='*70}")
 
     # 改进分析
-    depth_improvement = ((np.mean(depth_errors_s1) - np.mean(depth_errors_s2)) / np.mean(depth_errors_s1) * 100)
-    print(f"\n改进分析:")
-    print(f"  Depth误差变化: {depth_improvement:.1f}% (正值表示Stage2更好)")
+    s1_vs_orig = (np.mean(depth_errors_orig) - np.mean(depth_errors_s1)) / np.mean(depth_errors_orig) * 100
+    s2_vs_orig = (np.mean(depth_errors_orig) - np.mean(depth_errors_s2)) / np.mean(depth_errors_orig) * 100
+    s2_vs_s1 = (np.mean(depth_errors_s1) - np.mean(depth_errors_s2)) / np.mean(depth_errors_s1) * 100
+    print(f"\n改进分析 (正值=训练后更好):")
+    print(f"  Stage1 vs Original: {s1_vs_orig:+.1f}%")
+    print(f"  Stage2 vs Original: {s2_vs_orig:+.1f}%")
+    print(f"  Stage2 vs Stage1:   {s2_vs_s1:+.1f}%")
 
     if pose_s1 and pose_s2:
         rot_improvement = ((np.mean(rot_s1) - np.mean(rot_s2)) / np.mean(rot_s1) * 100)
@@ -538,11 +650,14 @@ def print_comparison_summary(results_stage1, results_stage2, iter_s1, iter_s2, n
 
 
 def main():
-    parser = argparse.ArgumentParser(description="长序列验证：Stage1 vs Stage2 vs GT")
+    parser = argparse.ArgumentParser(description="长序列验证：Original vs Stage1 vs Stage2 vs GT")
     parser.add_argument('--stage1_checkpoint', type=str,
                         default='try_train/checkpoints/v2_smoke_test/checkpoint_final.pt')
     parser.add_argument('--stage2_checkpoint', type=str,
                         default='try_train/checkpoints/stage2_smoke_test/checkpoint_stage2_final.pt')
+    parser.add_argument('--original_model', type=str,
+                        default='/home/shared_files/model_weights/linbo_map/lingbot-map.pt',
+                        help='原始LingBot-Map模型权重路径')
     parser.add_argument('--data_root', type=str,
                         default='/home/shared_files/datasets/dovsg/Replica/room0')
     parser.add_argument('--num_views', type=int, default=8, help='长序列views数')
@@ -553,26 +668,30 @@ def main():
     args = parser.parse_args()
 
     print(f"\n{'='*70}")
-    print(f"长序列验证：Stage1 vs Stage2 vs GT")
+    print(f"长序列验证：Original vs Stage1 vs Stage2 vs GT")
     print(f"{'='*70}")
+    print(f"Original: {args.original_model}")
     print(f"Stage1: {args.stage1_checkpoint}")
     print(f"Stage2: {args.stage2_checkpoint}")
     print(f"Data: {args.data_root}")
     print(f"Num views: {args.num_views}")
     print(f"Num samples: {args.num_samples}")
 
+    # 加载原始模型
+    original_model = load_original_model(args.original_model, args.device)
+
     # 验证
-    results_stage1, results_stage2, results_gt, iter_s1, iter_s2 = validate_long_sequence(
-        args.stage1_checkpoint, args.stage2_checkpoint, args.data_root,
+    results_stage1, results_stage2, results_orig, results_gt, iter_s1, iter_s2 = validate_long_sequence(
+        args.stage1_checkpoint, args.stage2_checkpoint, original_model, args.data_root,
         args.num_views, args.num_samples, args.max_dim, args.device
     )
 
     # 打印总结
-    print_comparison_summary(results_stage1, results_stage2, iter_s1, iter_s2, args.num_views)
+    print_comparison_summary(results_stage1, results_stage2, results_orig, iter_s1, iter_s2, args.num_views)
 
     # 可视化
     visualize_long_sequence_comparison(
-        results_stage1, results_stage2, results_gt,
+        results_stage1, results_stage2, results_orig, results_gt,
         args.output_dir, args.num_views
     )
 

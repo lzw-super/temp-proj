@@ -23,6 +23,10 @@ import cv2
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from lingbot_map.models.gct_stream import GCTStream
+from lingbot_map.utils.load_fn import load_and_preprocess_images
 
 from replica_dataset import ReplicaDataset
 from head_only_model import create_head_only_model
@@ -47,6 +51,56 @@ def quaternion_geodesic_distance(q1, q2):
     return np.degrees(angle)
 
 
+def load_original_model(model_path, device='cuda'):
+    """加载原始LingBot-Map模型"""
+    model = GCTStream(
+        img_size=518, patch_size=14, enable_3d_rope=True,
+        max_frame_num=100, kv_cache_sliding_window=64,
+        kv_cache_scale_frames=8, kv_cache_cross_frame_special=True,
+        kv_cache_include_scale_frames=True, use_sdpa=True,
+    )
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    state_dict = ckpt.get("model", ckpt)
+    model.load_state_dict(state_dict, strict=False)
+    model = model.to(device).eval()
+    print(f"[Original Model] Loaded from {model_path}")
+    return model
+
+
+def infer_original_model(model, image_paths, device='cuda'):
+    """用原始模型推理（518分辨率，streaming模式）"""
+    images = load_and_preprocess_images(image_paths, mode="crop", image_size=518, patch_size=14)
+    images = images.unsqueeze(0).to(device)
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+        predictions = model.inference_streaming(images, num_scale_frames=8)
+    depth_pred = predictions['depth']
+    if depth_pred.dim() == 5:
+        depth_pred = depth_pred.squeeze(-1)
+    return depth_pred[0].cpu().float().numpy()  # [S, H, W]
+
+
+def resize_depth_to_gt(depth_pred, gt_shape):
+    """将预测深度resize到GT分辨率"""
+    if depth_pred.shape == gt_shape:
+        return depth_pred
+    return cv2.resize(depth_pred, (gt_shape[1], gt_shape[0]), interpolation=cv2.INTER_LINEAR)
+
+
+def align_depth_scale(pred, gt, mask):
+    """使用最小二乘法将预测深度对齐到GT的尺度 (scale * pred + shift = gt)"""
+    pred_valid = pred[mask]
+    gt_valid = gt[mask]
+    if len(pred_valid) < 10:
+        return pred
+    A = np.column_stack([pred_valid, np.ones_like(pred_valid)])
+    result = np.linalg.lstsq(A, gt_valid, rcond=None)
+    scale, shift = result[0][0], result[0][1]
+    aligned = scale * pred + shift
+    aligned = np.maximum(aligned, 0)
+    return aligned
+
+
 def load_checkpoint_v2(checkpoint_path, device='cuda'):
     """加载 checkpoint（iteration-based版本）"""
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -56,8 +110,8 @@ def load_checkpoint_v2(checkpoint_path, device='cuda'):
     return ckpt
 
 
-def validate_model_v2(model, dataset, device='cuda', num_samples=5):
-    """验证模型推理（论文4.1对齐版，包含depth和pose）"""
+def validate_model_v2(model, original_model, dataset, data_root, device='cuda', num_samples=5):
+    """验证模型推理（论文4.1对齐版，包含depth和pose，含原始模型对比）"""
     model.eval()
 
     results = []
@@ -69,9 +123,15 @@ def validate_model_v2(model, dataset, device='cuda', num_samples=5):
             depths_gt = sample['depths'].to(device)  # [V, H, W]
             poses_gt = sample['poses'].to(device)  # [V, 4, 4]
             valid_masks = sample['valid_masks'].to(device)
+            frame_ids = sample['frame_ids']
 
             # 推理
             predictions = model(images)
+
+            # 原始模型推理（518分辨率）
+            image_paths = [str(Path(data_root) / "results" / f"frame{fid:06d}.jpg") for fid in frame_ids]
+            print(f"  原始模型推理中...")
+            depth_pred_orig = infer_original_model(original_model, image_paths, device)
 
             # 检查深度预测
             depth_pred = predictions['depth']  # [1, V, H, W, 1] or [1, V, H, W]
@@ -130,6 +190,12 @@ def validate_model_v2(model, dataset, device='cuda', num_samples=5):
                             rot_error_deg = quaternion_geodesic_distance(quat_pred, quat_gt)
                             trans_error_m = np.linalg.norm(center_pred - center_gt)
 
+                    # 原始模型深度：resize到GT分辨率并做尺度对齐
+                    orig_v = resize_depth_to_gt(depth_pred_orig[v], gt_v.shape)
+                    orig_v = align_depth_scale(orig_v, gt_v, valid_mask)
+                    orig_valid = orig_v[valid_mask]
+                    rel_err_orig = np.abs(orig_valid - gt_valid) / (gt_valid + 1e-3)
+
                     results.append({
                         'sample_idx': i,
                         'view_idx': v,
@@ -143,6 +209,8 @@ def validate_model_v2(model, dataset, device='cuda', num_samples=5):
                         'rot_error_deg': rot_error_deg,
                         'trans_error_m': trans_error_m,
                         'depth_pred': pred_v,
+                        'depth_orig': orig_v,
+                        'rel_err_orig': rel_err_orig.mean(),
                         'depth_gt': gt_v,
                         'valid_mask': valid_mask,
                         'pose_gt': pose_gt_v,
@@ -151,7 +219,7 @@ def validate_model_v2(model, dataset, device='cuda', num_samples=5):
 
                     print(f"[Sample {i}, View {v}]")
                     print(f"  Depth: pred=[{pred_min:.3f}, {pred_max:.3f}], gt=[{gt_min:.3f}, {gt_max:.3f}]")
-                    print(f"  Depth Rel Error: {mean_rel_error:.3f}")
+                    print(f"  Depth Rel Error: trained={mean_rel_error:.3f}, original={rel_err_orig.mean():.3f}")
                     if rot_error_deg is not None:
                         print(f"  Pose: rot_error={rot_error_deg:.2f}deg, trans_error={trans_error_m:.3f}m")
 
@@ -159,7 +227,7 @@ def validate_model_v2(model, dataset, device='cuda', num_samples=5):
 
 
 def visualize_results_v2(results, output_dir):
-    """可视化深度和位姿预测结果（使用灰度colormap）"""
+    """可视化深度和位姿预测结果（4行对比：GT / Original / Trained / Error）"""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -169,34 +237,74 @@ def visualize_results_v2(results, output_dir):
 
     for idx, result in enumerate(results[:5]):  # 只可视化前5个
         depth_pred = result['depth_pred']
+        depth_orig = result['depth_orig']
         depth_gt = result['depth_gt']
         valid_mask = result['valid_mask']
 
-        # 创建对比图（使用灰度colormap）
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        # 创建4列对比图：GT / Original / Trained / Error
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
 
-        # 预测深度（灰度）
-        pred_vis = np.ma.masked_where(~valid_mask, depth_pred)
-        im_pred = axes[0].imshow(pred_vis, cmap='gray', vmin=0, vmax=vmax)
-        axes[0].set_title(f'Predicted Depth\n(range: {result["pred_min"]:.2f}-{result["pred_max"]:.2f}m)')
-        axes[0].axis('off')
-        plt.colorbar(im_pred, ax=axes[0], fraction=0.046, pad=0.04)
-
-        # GT深度（灰度）
+        # 第一行：4个深度图
+        # GT深度
         gt_vis = np.ma.masked_where(~valid_mask, depth_gt)
-        im_gt = axes[1].imshow(gt_vis, cmap='gray', vmin=0, vmax=vmax)
-        axes[1].set_title(f'GT Depth\n(range: {result["gt_min"]:.2f}-{result["gt_max"]:.2f}m)')
-        axes[1].axis('off')
-        plt.colorbar(im_gt, ax=axes[1], fraction=0.046, pad=0.04)
+        im_gt = axes[0, 0].imshow(gt_vis, cmap='gray', vmin=0, vmax=vmax)
+        axes[0, 0].set_title(f'GT Depth\n(range: {result["gt_min"]:.2f}-{result["gt_max"]:.2f}m)')
+        axes[0, 0].axis('off')
+        plt.colorbar(im_gt, ax=axes[0, 0], fraction=0.046, pad=0.04)
 
-        # 误差图（保持hot colormap，因为是误差图）
-        error = np.abs(depth_pred - depth_gt)
-        error_vis = np.ma.masked_where(~valid_mask, error)
-        im_err = axes[2].imshow(error_vis, cmap='hot', vmin=0, vmax=2)
-        axes[2].set_title(f'Absolute Error\n(rel_error: {result["mean_rel_error"]:.3f})')
-        axes[2].axis('off')
-        plt.colorbar(im_err, ax=axes[2], fraction=0.046, pad=0.04)
+        # 原始模型深度（灰度）
+        orig_vis = np.ma.masked_where(~valid_mask, depth_orig)
+        im_orig = axes[0, 1].imshow(orig_vis, cmap='gray', vmin=0, vmax=vmax)
+        axes[0, 1].set_title(f'Original LingBot-Map\n(rel_err: {result["rel_err_orig"]:.3f})')
+        axes[0, 1].axis('off')
+        plt.colorbar(im_orig, ax=axes[0, 1], fraction=0.046, pad=0.04)
 
+        # 训练后预测深度（灰度）
+        pred_vis = np.ma.masked_where(~valid_mask, depth_pred)
+        im_pred = axes[0, 2].imshow(pred_vis, cmap='gray', vmin=0, vmax=vmax)
+        axes[0, 2].set_title(f'Trained Model\n(rel_err: {result["mean_rel_error"]:.3f})')
+        axes[0, 2].axis('off')
+        plt.colorbar(im_pred, ax=axes[0, 2], fraction=0.046, pad=0.04)
+
+        # 误差对比图
+        err_orig = np.abs(depth_orig - depth_gt)
+        err_trained = np.abs(depth_pred - depth_gt)
+        improvement = err_orig - err_trained  # 正值=训练后更好
+        vis = np.ma.masked_where(~valid_mask, improvement)
+        axes[0, 3].imshow(vis, cmap='RdBu', vmin=-1, vmax=1)
+        axes[0, 3].set_title('Orig - Trained Error\n(Blue: trained better)')
+        axes[0, 3].axis('off')
+
+        # 第二行：3个误差图 + 误差分布
+        # Original绝对误差
+        error_orig_vis = np.ma.masked_where(~valid_mask, err_orig)
+        im_err_o = axes[1, 0].imshow(error_orig_vis, cmap='hot', vmin=0, vmax=2)
+        axes[1, 0].set_title(f'Original Abs Error\n(mean: {result["rel_err_orig"]:.3f})')
+        axes[1, 0].axis('off')
+        plt.colorbar(im_err_o, ax=axes[1, 0], fraction=0.046, pad=0.04)
+
+        # Trained绝对误差
+        error_trained_vis = np.ma.masked_where(~valid_mask, err_trained)
+        im_err_t = axes[1, 1].imshow(error_trained_vis, cmap='hot', vmin=0, vmax=2)
+        axes[1, 1].set_title(f'Trained Abs Error\n(mean: {result["mean_rel_error"]:.3f})')
+        axes[1, 1].axis('off')
+        plt.colorbar(im_err_t, ax=axes[1, 1], fraction=0.046, pad=0.04)
+
+        # 误差差异
+        axes[1, 2].imshow(vis, cmap='RdBu', vmin=-1, vmax=1)
+        axes[1, 2].set_title('Error Diff (Orig - Trained)')
+        axes[1, 2].axis('off')
+
+        # 误差对比柱状图
+        models = ['Original', 'Trained']
+        means = [result['rel_err_orig'], result['mean_rel_error']]
+        colors = ['red', 'blue']
+        axes[1, 3].bar(models, means, color=colors, alpha=0.7, edgecolor='black')
+        axes[1, 3].set_ylabel('Depth Relative Error')
+        for j, m in enumerate(means):
+            axes[1, 3].text(j, m + 0.01, f'{m:.3f}', ha='center', fontsize=10)
+
+        plt.suptitle(f'Sample {idx}: GT vs Original vs Trained Depth', fontsize=12)
         plt.tight_layout()
         save_path = output_dir / f'depth_comparison_v2_{idx}.png'
         plt.savefig(save_path, dpi=150)
@@ -230,9 +338,12 @@ def visualize_results_v2(results, output_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="验证论文4.1对齐训练后的模型")
+    parser = argparse.ArgumentParser(description="验证论文4.1对齐训练后的模型（含原始模型对比）")
     parser.add_argument('--checkpoint', type=str, required=True, help='checkpoint文件路径')
     parser.add_argument('--data_root', type=str, required=True, help='Replica数据根目录')
+    parser.add_argument('--original_model', type=str,
+                        default='/home/shared_files/model_weights/linbo_map/lingbot-map.pt',
+                        help='原始LingBot-Map模型权重路径')
     parser.add_argument('--num_samples', type=int, default=10, help='验证样本数')
     parser.add_argument('--output_dir', type=str, default='try_train/vis_results_v2', help='可视化输出目录')
     parser.add_argument('--device', type=str, default='cuda')
@@ -267,16 +378,21 @@ def main():
         color_jitter_prob=0.0,  # 验证时不使用增强
     )
 
-    # 4. 验证推理
+    # 4. 加载原始LingBot-Map模型
+    original_model = load_original_model(args.original_model, args.device)
+
+    # 5. 验证推理
     print(f"\n{'='*60}")
     print(f"验证推理")
     print(f"{'='*60}")
-    results = validate_model_v2(model, dataset, args.device, args.num_samples)
+    results = validate_model_v2(model, original_model, dataset, args.data_root, args.device, args.num_samples)
 
-    # 5. 统计汇总
+    # 6. 统计汇总
     if len(results) > 0:
         all_rel_errors = [r['mean_rel_error'] for r in results]
+        all_rel_errors_orig = [r['rel_err_orig'] for r in results]
         mean_depth_error = np.mean(all_rel_errors)
+        mean_depth_error_orig = np.mean(all_rel_errors_orig)
 
         pose_results = [r for r in results if r['rot_error_deg'] is not None]
 
@@ -284,9 +400,12 @@ def main():
         print(f"验证结果汇总")
         print(f"{'='*60}")
         print(f"  Depth 相对误差:")
-        print(f"    - 平均: {mean_depth_error:.4f}")
-        print(f"    - 最小: {min(all_rel_errors):.4f}")
-        print(f"    - 最大: {max(all_rel_errors):.4f}")
+        print(f"    - Trained 平均: {mean_depth_error:.4f}")
+        print(f"    - Original 平均: {mean_depth_error_orig:.4f}")
+        improvement = (mean_depth_error_orig - mean_depth_error) / mean_depth_error_orig * 100
+        print(f"    - 改进: {improvement:+.1f}% (正值=训练后更好)")
+        print(f"    - Trained 最小/最大: {min(all_rel_errors):.4f} / {max(all_rel_errors):.4f}")
+        print(f"    - Original 最小/最大: {min(all_rel_errors_orig):.4f} / {max(all_rel_errors_orig):.4f}")
 
         if len(pose_results) > 0:
             rot_errors = [r['rot_error_deg'] for r in pose_results]
@@ -295,7 +414,7 @@ def main():
             print(f"    - Rotation: 平均 {np.mean(rot_errors):.2f}deg, 范围 [{np.min(rot_errors):.2f}, {np.max(rot_errors):.2f}]")
             print(f"    - Translation: 平均 {np.mean(trans_errors):.3f}m, 范围 [{np.min(trans_errors):.3f}, {np.max(trans_errors):.3f}]")
 
-        # 6. 可视化
+        # 7. 可视化
         visualize_results_v2(results, args.output_dir)
 
     print(f"\n{'='*60}")
