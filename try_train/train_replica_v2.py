@@ -151,6 +151,12 @@ def main():
     parser.add_argument('--min_lr', type=float, default=1e-8,
                         help="Minimum learning rate (论文=1e-8)")
 
+    # Geometric augmentation 参数
+    parser.add_argument('--no_geometric_aug', action='store_true',
+                        help="禁用几何增强（spatial rescale + aspect-ratio）")
+    parser.add_argument('--no_co_jitter', action='store_true',
+                        help="禁用 co-jitter（多view共享颜色扰动改为独立jitter）")
+
     # 其他参数
     parser.add_argument('--use_amp', type=bool, default=True)
     parser.add_argument('--output_dir', type=str, default='./checkpoints')
@@ -186,6 +192,8 @@ def main():
     print(f"  - train_pose: {args.train_pose}")
     print(f"  - rel_pose_weight: {args.rel_pose_weight} (start at {args.rel_pose_start_iter})")
     print(f"  - views: [{args.min_views}, {args.max_views}]")
+    print(f"  - geometric_aug: {not args.no_geometric_aug}")
+    print(f"  - co_jitter: {not args.no_co_jitter}")
     print(f"Data: {args.data_root}")
 
     # 1. DataLoader（支持视角范围采样）
@@ -202,6 +210,9 @@ def main():
         seed=args.seed,
         sampler_type=args.sampler_type,
         spatial_radius=args.spatial_radius,
+        spatial_rescale_range=None if args.no_geometric_aug else (0.8, 1.2),
+        aspect_ratio_range=None if args.no_geometric_aug else (0.33, 1.0),
+        co_jitter=not args.no_co_jitter,
     )
 
     # 限制样本数量用于快速测试

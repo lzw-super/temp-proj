@@ -456,12 +456,18 @@ class RelativePoseLoss(nn.Module):
                 # T_i_to_j_pred = inv(T_i_pred) @ T_j_pred
                 T_i_pred = pose_pred[:, i, :, :]  # [B, 4, 4]
                 T_j_pred = pose_pred[:, j, :, :]  # [B, 4, 4]
-                T_i_to_j_pred = torch.linalg.inv(T_i_pred) @ T_j_pred  # [B, 4, 4]
+                # Skip pairs where predicted pose matrix is near-singular
+                det_pred = torch.det(T_i_pred.float())
+                if (det_pred.abs() < 1e-4).any():
+                    continue
+
+                # Compute relative pose using float32 for numerical stability
+                T_i_to_j_pred = (torch.linalg.inv(T_i_pred.float()) @ T_j_pred.float()).to(T_i_pred.dtype)
 
                 # T_i_to_j_gt = inv(T_i_gt) @ T_j_gt
                 T_i_gt = pose_gt[:, i, :, :]
                 T_j_gt = pose_gt[:, j, :, :]
-                T_i_to_j_gt = torch.linalg.inv(T_i_gt) @ T_j_gt
+                T_i_to_j_gt = (torch.linalg.inv(T_i_gt.float()) @ T_j_gt.float()).to(T_i_gt.dtype)
 
                 # 提取 relative translation 和 rotation
                 trans_pred = T_i_to_j_pred[:, :3, 3]
