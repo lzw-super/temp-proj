@@ -129,7 +129,7 @@ def load_trained_model(checkpoint_path, num_views, device='cuda'):
         train_pose_head=model_args.get('train_pose', True),
         num_views=num_views,
     )
-    model.load_state_dict(ckpt['model_state_dict'])
+    model.load_state_dict(ckpt['model_state_dict'], strict=False)
     model = model.to(device).eval()
     return model, ckpt['iteration']
 

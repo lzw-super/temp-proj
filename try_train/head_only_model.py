@@ -97,6 +97,68 @@ class HeadOnlyModel(nn.Module):
 
         self.norm = nn.LayerNorm(embed_dim)
 
+        # ImageNet 归一化常量（DINOv2 训练时使用 ImageNet mean/std）
+        self.register_buffer(
+            'imagenet_mean',
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
+        )
+        self.register_buffer(
+            'imagenet_std',
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+        )
+
+        # 从 DINOv2 不同深度的 block 提取中间特征（多尺度）
+        self.intermediate_block_indices = self._get_intermediate_block_indices(backbone_name)
+        self._hook_features = {}
+        self._hooks = []
+        self._register_intermediate_hooks()
+
+        print(f"  - Intermediate blocks: {self.intermediate_block_indices}")
+
+    def _get_intermediate_block_indices(self, backbone_name):
+        """根据 backbone 类型确定提取中间特征的 block 索引
+
+        DPTHead 需要4组不同深度的特征来实现多尺度融合：
+        - 浅层: 边缘、纹理等低级特征
+        - 中浅层: 中级特征
+        - 中深层: 高级特征
+        - 深层: 语义特征
+        """
+        block_count_map = {
+            'dinov2_vits14': 12,
+            'dinov2_vitb14': 12,
+            'dinov2_vitl14': 24,
+        }
+        num_blocks = block_count_map.get(backbone_name, 12)
+        indices = [
+            num_blocks // 4 - 1,       # 浅层
+            num_blocks // 2 - 1,       # 中浅层
+            3 * num_blocks // 4 - 1,   # 中深层
+            num_blocks - 1,            # 深层
+        ]
+        return indices
+
+    def _register_intermediate_hooks(self):
+        """在 DINOv2 的中间 block 上注册 forward hook"""
+        self._remove_hooks()
+        for idx in self.intermediate_block_indices:
+            hook = self.backbone.blocks[idx].register_forward_hook(
+                self._make_hook(idx)
+            )
+            self._hooks.append(hook)
+
+    def _make_hook(self, block_idx):
+        """创建 hook 函数，捕获指定 block 的输出"""
+        def hook(module, input, output):
+            self._hook_features[block_idx] = output
+        return hook
+
+    def _remove_hooks(self):
+        """移除所有已注册的 hooks"""
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks = []
+
     def _load_dinov2_backbone(self, backbone_name):
         # DINOv2 需要通过 torch.hub 加载，不是 torchvision.models
         backbone_map = {
@@ -118,18 +180,25 @@ class HeadOnlyModel(nn.Module):
         前向传播
 
         Args:
-            images: [B, V, 3, H, W], RGB图像
+            images: [B, V, 3, H, W], RGB图像（[0,1]范围）
 
         Returns:
             predictions dict with depth/pose
         """
         B, V, C, H, W = images.shape
-        images_flat = images.view(B * V, C, H, W)
 
-        # Backbone 特征提取
+        # ImageNet 归一化：DINOv2 训练时使用 ImageNet mean/std
+        images_normalized = (images - self.imagenet_mean) / self.imagenet_std
+        images_flat = images_normalized.view(B * V, C, H, W)
+
+        # 清除上一次的 hook 缓存
+        self._hook_features = {}
+
+        # Backbone 特征提取（hooks 自动捕获中间层特征）
         with torch.no_grad() if self.freeze_backbone else torch.enable_grad():
             features = self.backbone.forward_features(images_flat)
 
+        # 最终输出（已经过 backbone.norm）
         if isinstance(features, dict):
             patch_tokens = features['x_norm_patchtokens']
             cls_token = features['x_norm_clstoken']
@@ -141,11 +210,27 @@ class HeadOnlyModel(nn.Module):
         patch_tokens = patch_tokens.view(B, V, num_patches, self.embed_dim)
         cls_token = cls_token.view(B, V, 1, self.embed_dim)
 
+        # 构建多尺度特征列表：从 hooks 中提取4个不同深度的特征
+        aggregated_tokens_list = []
+        pose_tokens_list = []
+        for block_idx in self.intermediate_block_indices:
+            if block_idx in self._hook_features:
+                feat = self._hook_features[block_idx]
+                # hook 捕获的是 block 输出（未经 backbone.norm），需要应用 norm
+                feat_normed = self.backbone.norm(feat)
+                inter_patch = feat_normed[:, 1:, :].view(B, V, num_patches, self.embed_dim)
+                inter_cls = feat_normed[:, 0:1, :].view(B, V, 1, self.embed_dim)
+                aggregated_tokens_list.append(inter_patch)
+                pose_tokens_list.append(inter_cls)
+            else:
+                # fallback
+                aggregated_tokens_list.append(patch_tokens)
+                pose_tokens_list.append(cls_token)
+
         predictions = {}
 
-        # Depth Head
+        # Depth Head - 使用多尺度特征（关键修复：不再重复同一特征）
         if self.depth_head is not None:
-            aggregated_tokens_list = [patch_tokens] * 4
             depth, depth_conf = self.depth_head(
                 aggregated_tokens_list,
                 images=images,
@@ -154,11 +239,9 @@ class HeadOnlyModel(nn.Module):
             predictions['depth'] = depth
             predictions['depth_conf'] = depth_conf
 
-        # Pose Head
+        # Pose Head - 使用多尺度 cls token
         if self.pose_head is not None:
-            pose_tokens = cls_token
-            pose_aggregated_list = [pose_tokens] * 4
-            pose_enc_list = self.pose_head(pose_aggregated_list, num_iterations=4)
+            pose_enc_list = self.pose_head(pose_tokens_list, num_iterations=4)
             predictions['pose_enc'] = pose_enc_list[-1]
 
         return predictions

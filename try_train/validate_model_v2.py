@@ -366,7 +366,7 @@ def main():
         train_pose_head=model_args.get('train_pose', True),
         num_views=2,
     )
-    model.load_state_dict(ckpt['model_state_dict'])
+    model.load_state_dict(ckpt['model_state_dict'], strict=False)
     model = model.to(args.device)
     print(f"[model] 加载权重完成")
 

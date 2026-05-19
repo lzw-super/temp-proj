@@ -199,7 +199,7 @@ def load_model_and_infer(checkpoint_path, images, device='cuda'):
         train_pose_head=model_args.get('train_pose', True),
         num_views=images.shape[1],
     )
-    model.load_state_dict(ckpt['model_state_dict'])
+    model.load_state_dict(ckpt['model_state_dict'], strict=False)
     model = model.to(device)
     model.eval()
 

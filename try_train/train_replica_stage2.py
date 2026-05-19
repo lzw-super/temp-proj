@@ -365,6 +365,10 @@ class ReplicaLongSequenceDataset(torch.utils.data.Dataset):
         intrinsics = torch.from_numpy(np.stack(intrinsics_list, axis=0))
         poses = torch.from_numpy(np.stack(poses_normalized, axis=0))
 
+        # Color jitter（与Stage1一致）
+        if random.random() < self.color_jitter_prob:
+            images = self._apply_color_jitter(images)
+
         return {
             'images': images,
             'depths': depths,
@@ -414,6 +418,31 @@ class ReplicaLongSequenceDataset(torch.utils.data.Dataset):
         for T_c2w in poses_list:
             poses_normalized.append(T_ref_inv @ T_c2w)
         return poses_normalized
+
+    def _apply_color_jitter(self, images):
+        """应用 color jitter（论文4.1对齐，与Stage1一致）"""
+        import torchvision.transforms.functional as F
+
+        images = torch.clamp(images, 0.0, 1.0)
+        V = images.shape[0]
+        jittered_images = []
+
+        brightness_factor = random.uniform(1 - self.brightness, 1 + self.brightness)
+        contrast_factor = random.uniform(1 - self.contrast, 1 + self.contrast)
+        saturation_factor = random.uniform(1 - self.saturation, 1 + self.saturation)
+        use_grayscale = random.random() < self.grayscale_prob
+
+        for v in range(V):
+            img_v = images[v]
+            img_v = F.adjust_brightness(img_v, brightness_factor)
+            img_v = F.adjust_contrast(img_v, contrast_factor)
+            img_v = F.adjust_saturation(img_v, saturation_factor)
+            if use_grayscale:
+                gray = 0.299 * img_v[0] + 0.587 * img_v[1] + 0.114 * img_v[2]
+                img_v = torch.stack([gray, gray, gray], dim=0)
+            jittered_images.append(torch.clamp(img_v, 0.0, 1.0))
+
+        return torch.stack(jittered_images, dim=0)
 
 
 def train_one_iteration_stage2(
@@ -515,10 +544,10 @@ def main():
     parser.add_argument('--rel_pose_start_iter', type=int, default=500)
 
     # View Curriculum 参数（论文4.2设置）
-    parser.add_argument('--views_start', type=int, default=24,
+    parser.add_argument('--views_start', type=int, default=8,
                         help="起始views数（论文=24，显存不足可用8）")
-    parser.add_argument('--views_end', type=int, default=320,
-                        help="目标views数（论文=320，显存不足可用64）")
+    parser.add_argument('--views_end', type=int, default=24,
+                        help="目标views数（论文=320，显存不足可用24）")
     parser.add_argument('--warmup_iterations', type=int, default=8000,
                         help="Warmup iterations (views数不增长)")
 
@@ -527,6 +556,10 @@ def main():
                         help="最小窗口大小（论文=16）")
     parser.add_argument('--k_max', type=int, default=64,
                         help="最大窗口大小（论文=64）")
+
+    # Dynamic batch packing（论文4.2设置）
+    parser.add_argument('--max_images_per_gpu', type=int, default=48,
+                        help="每GPU最大图像数，动态调整batch_size")
 
     # Foldback Sampler 参数
     parser.add_argument('--stride_min', type=int, default=1)
@@ -569,8 +602,11 @@ def main():
     print(f"  - stage1 checkpoint: {args.stage1_checkpoint}")
     print(f"Data: {args.data_root}")
 
-    # 1. 创建 Foldback Sampler
-    total_frames = 2000  # Replica room0 通常有2000帧
+    # 1. 动态检测总帧数
+    traj_file = Path(args.data_root) / "traj.txt"
+    with open(traj_file, 'r') as f:
+        total_frames = len([l for l in f.readlines() if len(l.strip().split()) == 16])
+    print(f"  - 检测到总帧数: {total_frames}")
     foldback_sampler = FoldbackVideoSampler(
         total_frames=total_frames,
         stride_range=(args.stride_min, args.stride_max),
@@ -669,7 +705,7 @@ def main():
     start_iteration = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=args.device)
-        model.load_state_dict(ckpt['model_state_dict'])
+        model.load_state_dict(ckpt['model_state_dict'], strict=False)
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         if ckpt['scheduler_state_dict']:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
@@ -689,6 +725,11 @@ def main():
         # 获取当前 views 数（基于 curriculum）
         current_views = view_curriculum.get_num_views_with_variance(iteration, variance=4)
         dataset.set_num_views(current_views)
+
+        # Dynamic batch packing: batch_size * current_views <= max_images_per_gpu
+        dynamic_batch_size = max(1, args.max_images_per_gpu // current_views)
+
+        # 获取当前 window pairs
 
         # 获取当前 window pairs
         k = window_sampler.sample_window_size()
@@ -712,7 +753,7 @@ def main():
             elapsed = time.time() - start_time
             current_lr = optimizer.param_groups[0]['lr']
             print(f"[Iter {iteration}/{args.total_iterations}] "
-                  f"Views: {current_views}, Window k: {k} "
+                  f"Views: {current_views}, Batch: {dynamic_batch_size}, Window k: {k} "
                   f"Loss: {loss_dict['total']:.4f} "
                   f"(depth: {loss_dict.get('depth', 0):.4f}, "
                   f"abs_pose: {loss_dict.get('abs_pose', 0):.4f}, "

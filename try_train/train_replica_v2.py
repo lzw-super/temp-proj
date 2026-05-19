@@ -116,6 +116,17 @@ def main():
     parser.add_argument('--train_pose', type=bool, default=True)  # 默认启用
     parser.add_argument('--rel_pose', type=bool, default=True)   # 默认启用
 
+    # 视角采样参数（论文4.1：views∈[2,24]）
+    parser.add_argument('--min_views', type=int, default=2,
+                        help="最小视角数（论文=2）")
+    parser.add_argument('--max_views', type=int, default=2,
+                        help="最大视角数（论文=24，当前head-only建议≤8避免显存问题）")
+    parser.add_argument('--sampler_type', type=str, default='temporal_nearby',
+                        choices=['temporal_nearby', 'spatial_nearby'],
+                        help="采样策略（默认temporal_nearby）")
+    parser.add_argument('--spatial_radius', type=float, default=5.0,
+                        help="spatial nearby 3D距离阈值（米）")
+
     # 训练参数（论文4.1设置）
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--total_iterations', type=int, default=5000,
@@ -174,17 +185,23 @@ def main():
     print(f"  - warmup: {warmup_iterations} ({args.warmup_ratio*100:.0f}%)")
     print(f"  - train_pose: {args.train_pose}")
     print(f"  - rel_pose_weight: {args.rel_pose_weight} (start at {args.rel_pose_start_iter})")
+    print(f"  - views: [{args.min_views}, {args.max_views}]")
     print(f"Data: {args.data_root}")
 
-    # 1. DataLoader
+    # 1. DataLoader（支持视角范围采样）
+    if args.min_views != args.max_views:
+        print(f"  - Views range: [{args.min_views}, {args.max_views}]")
     train_dataloader = create_replica_dataloader(
         data_root=args.data_root,
         batch_size=args.batch_size,
-        num_views=2,  # 先用固定值，后续改为范围
+        min_views=args.min_views,
+        max_views=args.max_views,
         max_dim=args.img_size,
         shuffle=True,
         num_workers=4,
         seed=args.seed,
+        sampler_type=args.sampler_type,
+        spatial_radius=args.spatial_radius,
     )
 
     # 限制样本数量用于快速测试
@@ -210,7 +227,7 @@ def main():
         img_size=args.img_size,
         train_depth_head=True,
         train_pose_head=args.train_pose,
-        num_views=2,
+        num_views=args.min_views,
     )
     model = model.to(args.device)
 
@@ -256,7 +273,7 @@ def main():
     start_iteration = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=args.device)
-        model.load_state_dict(ckpt['model_state_dict'])
+        model.load_state_dict(ckpt['model_state_dict'], strict=False)
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         if ckpt['scheduler_state_dict']:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
