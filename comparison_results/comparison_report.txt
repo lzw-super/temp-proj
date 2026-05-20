@@ -1,0 +1,18 @@
+============================================================
+DINOv2 vs TIPSv2 Backbone 数值对比报告
+============================================================
+
+[深度对比]
+  MAE: 0.4644
+  RMSE: 0.6089
+  Median: 0.3600
+  Max: 2.1176
+  Valid ratio: 100.0%
+
+[位姿对比]
+  Rotation MAE: 7.08 deg
+  Rotation RMSE: 7.74 deg
+  Rotation Max: 14.18 deg
+  Translation MAE: 0.3092
+  Translation RMSE: 0.4147
+  Translation Max: 0.8622

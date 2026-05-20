@@ -21,3 +21,4 @@ video_data/
 video_data_*
 *.png
 *.pt
+*.npz
