@@ -23,4 +23,5 @@ video_data_*
 *.pt 
 checkpoints
 comparison_results 
-token_comparison_results
+token_comparison_results 
+open-view_frames

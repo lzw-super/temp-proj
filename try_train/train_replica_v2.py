@@ -19,12 +19,14 @@ import os
 import sys
 import argparse
 import time
+import json
 from pathlib import Path
 
 import torch
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -87,6 +89,69 @@ def train_one_iteration(
     loss_dict['total'] = loss.item()
 
     return loss_dict
+
+
+def _plot_loss_curves(loss_history, vis_dir):
+    """Plot and save loss curves"""
+    iters = loss_history['iterations']
+    if len(iters) == 0:
+        return
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+    # Total loss
+    axes[0, 0].plot(iters, loss_history['total'], 'b-', linewidth=0.8)
+    axes[0, 0].set_title('Total Loss')
+    axes[0, 0].set_xlabel('Iteration')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Depth loss
+    axes[0, 1].plot(iters, loss_history['depth'], 'g-', linewidth=0.8)
+    axes[0, 1].set_title('Depth Loss (masked_log_l1)')
+    axes[0, 1].set_xlabel('Iteration')
+    axes[0, 1].set_ylabel('Loss')
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Abs pose loss
+    axes[0, 2].plot(iters, loss_history['abs_pose'], 'r-', linewidth=0.8)
+    axes[0, 2].set_title('Absolute Pose Loss')
+    axes[0, 2].set_xlabel('Iteration')
+    axes[0, 2].set_ylabel('Loss')
+    axes[0, 2].grid(True, alpha=0.3)
+
+    # Rel pose loss
+    rel_pose_vals = loss_history['rel_pose']
+    axes[1, 0].plot(iters, rel_pose_vals, 'm-', linewidth=0.8)
+    axes[1, 0].set_title('Relative Pose Loss')
+    axes[1, 0].set_xlabel('Iteration')
+    axes[1, 0].set_ylabel('Loss')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Learning rate
+    axes[1, 1].plot(iters, loss_history['lr'], 'k-', linewidth=0.8)
+    axes[1, 1].set_title('Learning Rate')
+    axes[1, 1].set_xlabel('Iteration')
+    axes[1, 1].set_ylabel('LR')
+    axes[1, 1].grid(True, alpha=0.3)
+    axes[1, 1].set_yscale('log')
+
+    # All losses overlaid (normalized)
+    for key, color, label in [('depth', 'g', 'depth'), ('abs_pose', 'r', 'abs_pose'), ('rel_pose', 'm', 'rel_pose')]:
+        vals = loss_history[key]
+        if max(vals) > 0:
+            axes[1, 2].plot(iters, vals, color=color, linewidth=0.8, label=label, alpha=0.8)
+    axes[1, 2].set_title('All Losses (overlay)')
+    axes[1, 2].set_xlabel('Iteration')
+    axes[1, 2].set_ylabel('Loss')
+    axes[1, 2].legend()
+    axes[1, 2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_path = vis_dir / 'loss_curves.png'
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"[loss_curves] Saved to {save_path}")
 
 
 def save_checkpoint(model, optimizer, scheduler, iteration, loss_dict, args, path):
@@ -296,6 +361,16 @@ def main():
     print(f"Starting training")
     print(f"{'='*60}")
 
+    # Loss history for plotting
+    loss_history = {
+        'iterations': [],
+        'total': [],
+        'depth': [],
+        'abs_pose': [],
+        'rel_pose': [],
+        'lr': [],
+    }
+
     start_time = time.time()
     iteration = start_iteration
     data_iter = iter(train_dataloader)
@@ -326,6 +401,14 @@ def main():
                   f"LR: {current_lr:.2e} "
                   f"Time: {elapsed:.2f}s")
 
+            # Record loss history
+            loss_history['iterations'].append(iteration)
+            loss_history['total'].append(loss_dict['total'])
+            loss_history['depth'].append(loss_dict.get('depth', 0))
+            loss_history['abs_pose'].append(loss_dict.get('abs_pose', 0))
+            loss_history['rel_pose'].append(loss_dict.get('rel_pose', 0))
+            loss_history['lr'].append(current_lr)
+
         # Save checkpoint
         if iteration % args.save_every == 0:
             save_checkpoint(model, optimizer, scheduler, iteration, loss_dict, args,
@@ -334,6 +417,18 @@ def main():
     # Final checkpoint
     save_checkpoint(model, optimizer, scheduler, iteration, loss_dict, args,
                    output_dir / 'checkpoint_final.pt')
+
+    # Save loss history JSON
+    vis_dir = output_dir / 'vis'
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    loss_json_path = vis_dir / 'loss_history.json'
+    with open(loss_json_path, 'w') as f:
+        json.dump(loss_history, f, indent=2)
+    print(f"[loss_history] Saved to {loss_json_path}")
+
+    # Plot loss curves
+    _plot_loss_curves(loss_history, vis_dir)
 
     print(f"\n{'='*60}")
     print(f"Training completed")
