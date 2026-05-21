@@ -43,6 +43,17 @@ from typing import Dict, List, Optional, Tuple, Union
 import cv2
 
 
+# Replica depth scale factor.
+#
+# Replica 的 depth*.png 是 uint16，但 NOT 标准毫米单位。
+# 学术界（NICE-SLAM / iMAP / GO-SLAM / MonoGS）都使用 scale = 6553.5，
+# 即 raw=65535 对应 ~10m（适合室内场景）。
+#
+# 早期代码错用 /1000 会让 Replica room0 的 depth 中位数变成 ~17m（错误），
+# 正确除以 6553.5 后中位数 ~2.69m（符合室内场景）。
+REPLICA_DEPTH_SCALE = 6553.5
+
+
 class ReplicaDataset(Dataset):
     """
     Replica 数据集
@@ -459,11 +470,17 @@ class ReplicaDataset(Dataset):
         return rgb.transpose(2, 0, 1)
 
     def _load_depth(self, frame_id: int) -> np.ndarray:
-        """加载深度图像，单位转换 mm -> m"""
+        """加载深度图像（Replica uint16 raw -> 米）
+
+        注意：Replica 不是标准毫米单位。其 depth*.png 是 uint16，
+        scale factor = REPLICA_DEPTH_SCALE (6553.5)，与 NICE-SLAM/iMAP/
+        GO-SLAM/MonoGS 等 Replica 学术工作一致：raw=65535 映射 ~10m。
+        早期 /1000 会让室内 depth 中位数变成 ~17m（错误）。
+        """
         depth_path = self.data_root / "results" / f"depth{frame_id:06d}.png"
         depth_png = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-        depth_mm = depth_png.astype(np.float32)
-        return depth_mm / 1000.0
+        depth_raw = depth_png.astype(np.float32)
+        return depth_raw / REPLICA_DEPTH_SCALE
 
     def _align_to_train_size(self, rgb, depth, K, max_dim):
         """对齐图像和内参到训练尺寸"""

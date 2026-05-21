@@ -31,6 +31,7 @@ from lingbot_map.utils.load_fn import load_and_preprocess_images
 
 from foldback_video_sampler import FoldbackVideoSampler
 from head_only_model import create_head_only_model
+from replica_dataset import REPLICA_DEPTH_SCALE
 
 
 # 创建专业的深度colormap（灰度）
@@ -124,10 +125,10 @@ def load_rgb_depth(data_root, frame_id):
     rgb = cv2.imread(str(rgb_path))
     rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
 
-    # Depth (uint16 mm -> m)
+    # Depth (Replica uint16 / 6553.5 -> m; NOT standard mm)
     depth_path = results_dir / f"depth{frame_id:06d}.png"
     depth_png = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-    depth_m = depth_png.astype(np.float32) / 1000.0
+    depth_m = depth_png.astype(np.float32) / REPLICA_DEPTH_SCALE
 
     return rgb, depth_m
 

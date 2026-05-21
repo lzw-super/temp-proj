@@ -31,7 +31,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from replica_dataset import ReplicaDataset
+from replica_dataset import ReplicaDataset, REPLICA_DEPTH_SCALE
 from foldback_video_sampler import (
     FoldbackVideoSampler,
     ProgressiveViewCurriculum,
@@ -338,10 +338,10 @@ class ReplicaLongSequenceDataset(torch.utils.data.Dataset):
             rgb = rgb.astype(np.float32) / 255.0
             rgb = rgb.transpose(2, 0, 1)
 
-            # 加载 depth
+            # 加载 depth (Replica scale: uint16 / 6553.5 -> meters)
             depth_path = self.data_root / "results" / f"depth{frame_id:06d}.png"
             depth_png = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-            depth_m = depth_png.astype(np.float32) / 1000.0
+            depth_m = depth_png.astype(np.float32) / REPLICA_DEPTH_SCALE
 
             T_c2w = self.poses[frame_id]
             K = self.intrinsic.copy()

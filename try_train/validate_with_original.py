@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from foldback_video_sampler import FoldbackVideoSampler
 from head_only_model import create_head_only_model
+from replica_dataset import REPLICA_DEPTH_SCALE
 
 
 def load_poses(data_root):
@@ -55,7 +56,8 @@ def load_rgb_depth(data_root, frame_id):
     rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
     depth_path = results_dir / f"depth{frame_id:06d}.png"
     depth_png = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-    depth_m = depth_png.astype(np.float32) / 1000.0
+    # Replica scale: uint16 / 6553.5 -> meters (not /1000)
+    depth_m = depth_png.astype(np.float32) / REPLICA_DEPTH_SCALE
     return rgb, depth_m
 
 
