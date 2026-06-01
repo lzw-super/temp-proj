@@ -101,6 +101,37 @@ def freeze_aggregator(model):
     print(f"[freeze_aggregator] Total: {total:,}")
 
 
+def random_init_heads(model, seed=None):
+    """Randomly initialize depth_head and camera_head parameters.
+
+    Args:
+        model: GCTStream model with depth_head and camera_head
+        seed: Optional seed for reproducible initialization
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    # Random init depth_head
+    for param in model.depth_head.parameters():
+        if param.dim() >= 2:
+            torch.nn.init.xavier_uniform_(param)
+        elif param.dim() == 1:
+            torch.nn.init.uniform_(param, -0.1, 0.1)
+
+    # Random init camera_head
+    for param in model.camera_head.parameters():
+        if param.dim() >= 2:
+            torch.nn.init.xavier_uniform_(param)
+        elif param.dim() == 1:
+            torch.nn.init.uniform_(param, -0.1, 0.1)
+
+    depth_params = sum(p.numel() for p in model.depth_head.parameters())
+    camera_params = sum(p.numel() for p in model.camera_head.parameters())
+
+    print(f"[random_init_heads] Depth head: {depth_params:,} parameters (xavier_uniform)")
+    print(f"[random_init_heads] Camera head: {camera_params:,} parameters (xavier_uniform)")
+
+
 # ---------------------------------------------------------------------------
 # Forward pass: aggregator no_grad + heads with grad
 # ---------------------------------------------------------------------------
@@ -349,6 +380,8 @@ def main():
     # Model
     parser.add_argument('--checkpoint', type=str, required=True,
                         help="Pretrained GCTStream checkpoint path")
+    parser.add_argument('--random_init_heads', action='store_true',
+                        help="Randomly initialize depth_head and camera_head (keep aggregator pretrained)")
     parser.add_argument('--use_sdpa', action='store_true', default=True,
                         help="Use SDPA backend for KV cache (default: True)")
     parser.add_argument('--use_flashinfer', dest='use_sdpa', action='store_false',
@@ -408,6 +441,10 @@ def main():
     print(f"{'='*60}")
     print(f"  - Model: GCTStream (full), Aggregator frozen, Heads trainable")
     print(f"  - Checkpoint: {args.checkpoint}")
+    if args.random_init_heads:
+        print(f"  - Head initialization: random (aggregator pretrained)")
+    else:
+        print(f"  - Head initialization: from checkpoint")
     print(f"  - Resolution: 518 (ViT-L/14 native)")
     print(f"  - lr: {args.lr}, weight_decay: {args.weight_decay}")
     print(f"  - total_iterations: {args.total_iterations}")
@@ -452,6 +489,11 @@ def main():
     # 2. Model
     model = load_gct_model(args.checkpoint, args.device, use_sdpa=args.use_sdpa)
     freeze_aggregator(model)
+
+    # Random init heads (optional)
+    if args.random_init_heads:
+        random_init_heads(model, seed=args.seed)
+        print(f"  - Head initialization: random (aggregator pretrained)")
 
     # 3. Loss functions (reuse from head_only_model)
     depth_loss_fn = DepthLoss(loss_type='masked_log_l1')

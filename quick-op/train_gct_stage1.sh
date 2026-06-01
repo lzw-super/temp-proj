@@ -34,4 +34,5 @@ conda run -n lingbot-map --no-capture-output python try_train/train_replica_gct.
   --total_iterations "${TOTAL_ITERS}" \
   --log_every "${LOG_EVERY}" \
   --save_every "${SAVE_EVERY}" \
-  --use_sdpa
+  --random_init_heads \
+  --use_sdpa 

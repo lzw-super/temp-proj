@@ -374,7 +374,7 @@ class PoseLoss(nn.Module):
         dot = torch.sum(q1 * q2, dim=-1)  # [B, V]
 
         # Clamp to avoid numerical issues
-        dot = torch.clamp(torch.abs(dot), min=0.0, max=1.0)
+        dot = torch.clamp(torch.abs(dot), min=0.0, max=1.0 - 1e-6)
 
         # Angle = 2 * arccos(|dot|)
         # 使用 arccos 的近似避免数值不稳定
@@ -560,7 +560,7 @@ class RelativePoseLoss(nn.Module):
             geodesic loss: scalar
         """
         dot = torch.sum(q1 * q2, dim=-1)
-        dot = torch.clamp(torch.abs(dot), min=0.0, max=1.0)
+        dot = torch.clamp(torch.abs(dot), min=0.0, max=1.0 - 1e-6)
         angle = 2.0 * torch.acos(dot)
         return angle.mean()
 

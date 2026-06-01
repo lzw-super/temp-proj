@@ -44,6 +44,21 @@ from head_only_model import (
 )
 
 
+def _se3_inv(T: torch.Tensor) -> torch.Tensor:
+    """Analytical inverse for SE(3) pose matrix [R|t; 0|1].
+    inv([R|t; 0|1]) = [R^T | -R^T @ t; 0 | 1]
+    More numerically stable than torch.linalg.inv for near-degenerate rotations.
+    """
+    R = T[:, :3, :3]
+    t = T[:, :3, 3]
+    R_t = R.transpose(-1, -2)
+    out = torch.zeros_like(T)
+    out[:, :3, :3] = R_t
+    out[:, :3, 3] = -torch.bmm(R_t, t.unsqueeze(-1)).squeeze(-1)
+    out[:, 3, 3] = 1.0
+    return out
+
+
 class LocalRelativePoseLoss(torch.nn.Module):
     """
     Local Relative Pose Loss: 只在局部窗口内计算 relative pose
@@ -98,12 +113,12 @@ class LocalRelativePoseLoss(torch.nn.Module):
             # T_i_to_j_pred = inv(T_i_pred) @ T_j_pred
             T_i_pred = pose_pred[:, i, :, :]
             T_j_pred = pose_pred[:, j, :, :]
-            T_i_to_j_pred = torch.linalg.inv(T_i_pred) @ T_j_pred
+            T_i_to_j_pred = _se3_inv(T_i_pred) @ T_j_pred
 
             # T_i_to_j_gt = inv(T_i_gt) @ T_j_gt
             T_i_gt = pose_gt[:, i, :, :]
             T_j_gt = pose_gt[:, j, :, :]
-            T_i_to_j_gt = torch.linalg.inv(T_i_gt) @ T_j_gt
+            T_i_to_j_gt = _se3_inv(T_i_gt) @ T_j_gt
 
             # 提取 relative translation 和 rotation
             trans_pred = T_i_to_j_pred[:, :3, 3]
@@ -112,15 +127,12 @@ class LocalRelativePoseLoss(torch.nn.Module):
             rot_pred_ij = T_i_to_j_pred[:, :3, :3]
             rot_gt_ij = T_i_to_j_gt[:, :3, :3]
 
-            quat_pred_ij = self._rotation_matrix_to_quaternion(rot_pred_ij)
-            quat_gt_ij = self._rotation_matrix_to_quaternion(rot_gt_ij)
-
             # Translation loss
             trans_diff = torch.abs(trans_pred - trans_gt)
             trans_loss = self._huber_loss(trans_diff)
 
             # Rotation loss
-            rot_loss = self._quaternion_geodesic_loss(quat_pred_ij, quat_gt_ij)
+            rot_loss = self._rotation_chordal_loss(rot_pred_ij, rot_gt_ij)
 
             total_loss += self.rotation_weight * rot_loss + self.translation_weight * trans_loss
             num_pairs += 1
@@ -163,12 +175,16 @@ class LocalRelativePoseLoss(torch.nn.Module):
         quat = torch.stack([qw, qx, qy, qz], dim=-1)
         return quat / (torch.norm(quat, dim=-1, keepdim=True) + 1e-8)
 
+    def _rotation_chordal_loss(self, R1, R2):
+        diff = R1.float() - R2.float()
+        return (diff * diff).mean()
+
     def _quaternion_geodesic_loss(self, q1, q2):
-        """Quaternion geodesic loss"""
-        dot = torch.sum(q1 * q2, dim=-1)
-        dot = torch.clamp(torch.abs(dot), min=0.0, max=1.0)
-        angle = 2.0 * torch.acos(dot)
-        return angle.mean()
+        """Stable quaternion rotation loss for local relative pose training."""
+        q1 = q1 / (torch.norm(q1, dim=-1, keepdim=True) + 1e-6)
+        q2 = q2 / (torch.norm(q2, dim=-1, keepdim=True) + 1e-6)
+        dot = torch.sum(q1 * q2, dim=-1).abs().clamp(max=1.0)
+        return (1.0 - dot).mean()
 
     def _huber_loss(self, diff, delta=1.0):
         """Huber loss"""

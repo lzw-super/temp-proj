@@ -8,7 +8,7 @@ GCTStream Head-Only Stage2 Training Script (论文4.2 对齐版)
   - Foldback Video Sampler（边界反向继续）
   - Progressive View Curriculum（views 数线性增长，如 8 -> 24）
   - Local Window Relative Pose Loss（窗口 k 在 [k_min, k_max] 随机采样）
-  - AdamW lr=5e-4, wd=0.05, 5% warmup + cosine decay
+  - AdamW lr=1e-4, wd=0.05, 5% warmup + cosine decay
 
 模型架构沿用 train_replica_gct.py：
   GCTStream = DINOv2 ViT-L/14 + AggregatorStream + CameraCausalHead + DPTHead
@@ -60,6 +60,27 @@ from train_replica_gct import (
     forward_gct_heads_only,  # Stage1 global-attention forward (not used here; kept for reference)
     align_depth_to_gt,
 )
+
+
+DEPTH_MIN = 1e-4
+DEPTH_MAX = 100.0
+
+
+def _assert_trainable_params_finite(model, context):
+    for name, param in model.named_parameters():
+        if param.requires_grad and not torch.isfinite(param).all():
+            raise RuntimeError(f"Non-finite trainable parameter detected after {context}: {name}")
+
+
+def _first_nonfinite_grad(model):
+    for name, param in model.named_parameters():
+        if not param.requires_grad or param.grad is None:
+            continue
+        grad = param.grad.detach()
+        if torch.isfinite(grad).all():
+            continue
+        return name, int(torch.isnan(grad).sum().item()), int(torch.isinf(grad).sum().item())
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -278,44 +299,88 @@ def train_one_iteration_gct_stage2(
             predictions['depth'], depths, valid_masks
         )
 
+        if not torch.isfinite(depth_pred).all():
+            optimizer.zero_grad(set_to_none=True)
+            return {'total': float('nan'), 'depth': float('nan'), 'skipped': 1.0}
+
+        depth_pred = depth_pred.float().clamp(min=DEPTH_MIN, max=DEPTH_MAX)
+        depths_safe = torch.nan_to_num(
+            depths.float(), nan=1.0, posinf=DEPTH_MAX, neginf=DEPTH_MIN
+        ).clamp(min=DEPTH_MIN, max=DEPTH_MAX)
+
         # Depth loss (on normalized scale if anchor norm enabled)
-        depth_loss = depth_loss_fn(depth_pred, depths, valid_masks_aligned)
+        depth_loss = depth_loss_fn(depth_pred, depths_safe, valid_masks_aligned)
         loss = depth_loss
         loss_dict = {'depth': depth_loss.item()}
         if anchor_s is not None:
             loss_dict['anchor_s'] = float(anchor_s.mean().item())
+        loss_dict['depth_min'] = float(depth_pred.detach().amin().item())
+        loss_dict['depth_max'] = float(depth_pred.detach().amax().item())
+
+        pose_enc = None
+        if 'pose_enc' in predictions:
+            if not torch.isfinite(predictions['pose_enc']).all():
+                optimizer.zero_grad(set_to_none=True)
+                return {'total': float('nan'), 'depth': loss_dict['depth'], 'skipped': 1.0}
+            pose_enc = predictions['pose_enc'].float()
 
         # Absolute pose loss
-        if pose_loss_fn is not None and 'pose_enc' in predictions:
-            pose_loss = pose_loss_fn(predictions['pose_enc'], poses)
+        if pose_loss_fn is not None and pose_enc is not None and args.pose_weight != 0:
+            pose_loss = pose_loss_fn(pose_enc, poses.float())
             loss = loss + args.pose_weight * pose_loss
             loss_dict['abs_pose'] = pose_loss.item()
 
         # Local window relative pose loss
-        if rel_pose_loss_fn is not None and 'pose_enc' in predictions:
+        if rel_pose_loss_fn is not None and pose_enc is not None and args.rel_pose_weight != 0:
             if iteration >= args.rel_pose_start_iter and len(window_pairs) > 0:
-                rel_pose_loss = rel_pose_loss_fn(predictions['pose_enc'], poses, window_pairs)
+                rel_pose_loss = rel_pose_loss_fn(pose_enc, poses.float(), window_pairs)
                 rel_val = rel_pose_loss.item() if torch.is_tensor(rel_pose_loss) else float(rel_pose_loss)
                 loss = loss + args.rel_pose_weight * rel_pose_loss
                 loss_dict['rel_pose'] = rel_val
             else:
                 loss_dict['rel_pose'] = 0.0
 
+    if not torch.isfinite(loss):
+        optimizer.zero_grad(set_to_none=True)
+        loss_dict['total'] = float('nan')
+        loss_dict['skipped'] = 1.0
+        return loss_dict
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     if args.use_amp and scaler:
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip_norm)
-        scaler.step(optimizer)
-        scaler.update()
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, args.gradient_clip_norm)
+        if torch.isfinite(grad_norm):
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            bad_grad = _first_nonfinite_grad(model)
+            if bad_grad is not None:
+                print(f"[nonfinite_grad] {bad_grad[0]} nan={bad_grad[1]} inf={bad_grad[2]}")
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            loss_dict['skipped'] = 1.0
     else:
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip_norm)
-        optimizer.step()
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, args.gradient_clip_norm)
+        if torch.isfinite(grad_norm):
+            optimizer.step()
+        else:
+            bad_grad = _first_nonfinite_grad(model)
+            if bad_grad is not None:
+                print(f"[nonfinite_grad] {bad_grad[0]} nan={bad_grad[1]} inf={bad_grad[2]}")
+            optimizer.zero_grad(set_to_none=True)
+            loss_dict['skipped'] = 1.0
+
+    _assert_trainable_params_finite(model, f"iteration {iteration}")
 
     if scheduler is not None:
         scheduler.step()
 
     loss_dict['total'] = loss.item()
+    loss_dict['grad_norm'] = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+    loss_dict.setdefault('skipped', 0.0)
     return loss_dict
 
 
@@ -399,8 +464,8 @@ def main():
     # Training params (paper 4.2)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--total_iterations', type=int, default=5000)
-    parser.add_argument('--lr', type=float, default=5e-4,
-                        help="Paper 4.2: lr=5e-4 (vs Stage1 lr=2e-4)")
+    parser.add_argument('--lr', type=float, default=1e-4,
+                        help="Conservative GCT head fine-tuning LR; paper 4.2 used 5e-4 at larger scale")
     parser.add_argument('--weight_decay', type=float, default=0.05)
     parser.add_argument('--gradient_clip_norm', type=float, default=1.0)
 
@@ -446,6 +511,7 @@ def main():
     parser.add_argument('--use_amp', type=bool, default=True)
     parser.add_argument('--output_dir', type=str, default='./checkpoints/gct_stage2')
     parser.add_argument('--save_every', type=int, default=1000)
+    parser.add_argument('--skip_final_save', action='store_true')
     parser.add_argument('--log_every', type=int, default=20)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--device', type=str, default='cuda')
@@ -460,7 +526,7 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    lr_warmup_iterations = int(args.total_iterations * args.lr_warmup_ratio)
+    lr_warmup_iterations = max(1, int(args.total_iterations * args.lr_warmup_ratio))
 
     print(f"\n{'='*60}")
     print(f"GCTStream Stage2 Head-Only Training (论文 4.2 对齐版)")
@@ -547,7 +613,7 @@ def main():
     )
     cosine_scheduler = CosineAnnealingLR(
         optimizer,
-        T_max=args.total_iterations - lr_warmup_iterations,
+        T_max=max(1, args.total_iterations - lr_warmup_iterations),
         eta_min=args.min_lr
     )
     scheduler = SequentialLR(
@@ -578,20 +644,19 @@ def main():
 
     loss_history = {
         'iterations': [], 'total': [], 'depth': [], 'abs_pose': [], 'rel_pose': [],
-        'lr': [], 'views': [],
+        'lr': [], 'views': [], 'grad_norm': [], 'skipped': [], 'depth_min': [], 'depth_max': [],
     }
 
     start_time = time.time()
     iteration = start_iteration
     data_iter = iter(train_dataloader)
+    loss_dict = {'total': 0.0}
 
     while iteration < args.total_iterations:
-        # Current views from curriculum (with small variance)
         current_views = view_curriculum.get_num_views_with_variance(iteration, variance=2)
-        current_views = max(2, current_views)  # ensure >= 2
+        current_views = max(2, current_views)
         dataset.set_num_views(current_views)
 
-        # Local window pairs
         k = window_sampler.sample_window_size()
         window_pairs = window_sampler.get_adjacent_pairs(current_views, k)
 
@@ -612,12 +677,15 @@ def main():
             elapsed = time.time() - start_time
             current_lr = optimizer.param_groups[0]['lr']
             anchor_s_str = f", anchor_s: {loss_dict.get('anchor_s', 0):.3f}" if 'anchor_s' in loss_dict else ""
+            grad_norm_str = f", grad_norm: {loss_dict.get('grad_norm', 0):.3f}" if 'grad_norm' in loss_dict else ""
+            skipped_str = f", skipped: {int(loss_dict.get('skipped', 0))}"
             print(f"[Iter {iteration}/{args.total_iterations}] "
                   f"Views: {current_views}, k: {k} "
                   f"Loss: {loss_dict['total']:.4f} "
                   f"(depth: {loss_dict.get('depth', 0):.4f}, "
                   f"abs_pose: {loss_dict.get('abs_pose', 0):.4f}, "
-                  f"rel_pose: {loss_dict.get('rel_pose', 0):.4f}{anchor_s_str}) "
+                  f"rel_pose: {loss_dict.get('rel_pose', 0):.4f}{anchor_s_str}"
+                  f"{grad_norm_str}{skipped_str}) "
                   f"LR: {current_lr:.2e} "
                   f"Time: {elapsed:.1f}s")
 
@@ -628,19 +696,24 @@ def main():
             loss_history['rel_pose'].append(loss_dict.get('rel_pose', 0))
             loss_history['lr'].append(current_lr)
             loss_history['views'].append(current_views)
+            loss_history['grad_norm'].append(loss_dict.get('grad_norm', 0))
+            loss_history['skipped'].append(loss_dict.get('skipped', 0))
+            loss_history['depth_min'].append(loss_dict.get('depth_min', 0))
+            loss_history['depth_max'].append(loss_dict.get('depth_max', 0))
 
         if iteration % args.save_every == 0:
             save_checkpoint(model, optimizer, scheduler, iteration, loss_dict, args,
-                           output_dir / f'checkpoint_iter_{iteration}.pt')
+                            output_dir / f'checkpoint_iter_{iteration}.pt')
 
         if iteration % 100 == 0:
             torch.cuda.empty_cache()
 
-    # Final checkpoint
-    save_checkpoint(model, optimizer, scheduler, iteration, loss_dict, args,
-                   output_dir / 'checkpoint_final.pt')
+    if args.skip_final_save:
+        print("[save_checkpoint] Skipped final checkpoint (--skip_final_save)")
+    else:
+        save_checkpoint(model, optimizer, scheduler, iteration, loss_dict, args,
+                        output_dir / 'checkpoint_final.pt')
 
-    # Save loss history and curves
     vis_dir = output_dir / 'vis'
     vis_dir.mkdir(parents=True, exist_ok=True)
     with open(vis_dir / 'loss_history.json', 'w') as f:

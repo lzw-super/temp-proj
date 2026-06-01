@@ -1,0 +1,88 @@
+{
+  "config": {
+    "data_root": "/home/shared_files/datasets/dovsg/Replica/room0",
+    "model_path": "/home/shared_files/model_weights/linbo_map/lingbot-map.pt",
+    "frame_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "preprocess_mode": "crop",
+    "image_size": 518,
+    "test_resolution": null,
+    "mode": "streaming",
+    "num_scale_frames": 8,
+    "replica_depth_scale": 6553.5
+  },
+  "shapes": {
+    "images": [
+      8,
+      3,
+      294,
+      518
+    ],
+    "pred_depth": [
+      8,
+      294,
+      518
+    ],
+    "gt_depth": [
+      8,
+      294,
+      518
+    ]
+  },
+  "gt_anchor_scales": {
+    "depth_median_proxy": 2.7240405082702637,
+    "paper_pointcloud_mean": 3.207278197156469
+  },
+  "global_scale_fit": {
+    "best_median_gt_over_pred": 3.177219779017685,
+    "best_over_depth_anchor_s": 1.1663628970903908,
+    "best_over_point_anchor_s": 0.9906280602145977
+  },
+  "metrics": {
+    "raw_pred_vs_gt_m": {
+      "valid_pixels": 1218333,
+      "abs_rel": 0.6841705121327181,
+      "rmse": 2.0087369198339853,
+      "log_l1": 1.1529660597726739,
+      "pred_median": 0.8650109767913818,
+      "gt_median": 2.7240405082702637,
+      "median_gt_over_pred": 3.177219779017685
+    },
+    "pred_times_best_scale_vs_gt_m": {
+      "valid_pixels": 1218333,
+      "abs_rel": 0.01503640532839752,
+      "rmse": 0.06235885149292374,
+      "log_l1": 0.014961737733565595,
+      "pred_median": 2.7483301162719727,
+      "gt_median": 2.7240405082702637,
+      "median_gt_over_pred": 1.0
+    },
+    "pred_times_depth_anchor_s_vs_gt_m": {
+      "valid_pixels": 1218333,
+      "abs_rel": 0.14002605788534417,
+      "rmse": 0.4188424619951801,
+      "log_l1": 0.15118389474848187,
+      "pred_median": 2.3563249111175537,
+      "gt_median": 2.7240405082702637,
+      "median_gt_over_pred": 1.1663629069043955
+    },
+    "pred_times_point_anchor_s_vs_gt_m": {
+      "valid_pixels": 1218333,
+      "abs_rel": 0.018010502970383133,
+      "rmse": 0.07014872846031843,
+      "log_l1": 0.017784663763456072,
+      "pred_median": 2.7743308544158936,
+      "gt_median": 2.7240405082702637,
+      "median_gt_over_pred": 0.9906280541476592
+    }
+  },
+  "interpretation": "Raw demo depth looks anchor-normalized (best scale is close to GT anchor_s)."
+}
