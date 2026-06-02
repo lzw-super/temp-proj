@@ -26,3 +26,4 @@ comparison_results
 token_comparison_results 
 open-view_frames
 try_train/untrained_depth_outputs
+*.sh

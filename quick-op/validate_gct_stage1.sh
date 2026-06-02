@@ -6,7 +6,7 @@ set -e
 
 DATA_ROOT="/home/shared_files/datasets/dovsg/Replica/room0"
 ORIGINAL_MODEL="/home/shared_files/model_weights/linbo_map/lingbot-map.pt"
-TRAINED_CKPT="try_train/checkpoints/gct_stage1_5k/checkpoint_final.pt"
+TRAINED_CKPT="try_train/checkpoints/gct_stage1_2-20_spatial_nearby_5000iters/checkpoint_final.pt"
 NUM_SAMPLES=${1:-20}
 
 echo "============================================================"
