@@ -150,10 +150,17 @@ class GCTStream(GCTBase):
         Returns:
             AggregatorStream module
         """
+        # Dynamically compute num_heads based on embed_dim
+        # ViT-L: embed_dim=1024 -> num_heads=16, head_dim=64
+        # ViT-B: embed_dim=768 -> num_heads=12, head_dim=64
+        # ViT-S: embed_dim=384 -> num_heads=6, head_dim=64
+        num_heads = self.embed_dim // 64
+
         return AggregatorStream(
             img_size=self.img_size,
             patch_size=self.patch_size,
             embed_dim=self.embed_dim,
+            num_heads=num_heads,
             patch_embed=self.patch_embed,
             pretrained_path=self.pretrained_path,
             disable_global_rope=self.disable_global_rope,

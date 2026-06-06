@@ -609,15 +609,19 @@ class AggregatorStream(AggregatorBase):
             self.rope3d = None
             return
 
-        num_heads = 16
-        head_dim = self.embed_dim // num_heads
+        # Dynamically compute num_heads based on embed_dim
+        # ViT-L: embed_dim=1024, num_heads=16, head_dim=64
+        # ViT-B: embed_dim=768, num_heads=12, head_dim=64
+        # ViT-S: embed_dim=384, num_heads=6, head_dim=64
+        num_heads = self.embed_dim // 64
+        head_dim = 64
 
         self.rope3d = WanRotaryPosEmbed(
             attention_head_dim=head_dim,
             patch_size=(1, self.patch_size, self.patch_size),
             max_seq_len=self.max_frame_num,
         )
-        logger.info(f"3D RoPE initialized for max {self.max_frame_num} frames, head_dim={head_dim}")
+        logger.info(f"3D RoPE initialized for max {self.max_frame_num} frames, head_dim={head_dim}, num_heads={num_heads}")
 
     def _get_3d_positions_streaming(self, num_frames, H, W, device, f_start, f_end):
         """
@@ -1184,29 +1188,61 @@ class AggregatorStream(AggregatorBase):
                 pos = pos.view(B, S_global, P, 2).view(B, S_global * P, 2)
 
         # ════════════════════════════════════════════════════════════════════
-        # 步骤6: 处理 global_blocks (带 KV Cache)
+        # 步骤6: 处理 global_blocks
         # ════════════════════════════════════════════════════════════════════
+        effective_sliding_window_size = (
+            self.sliding_window_size if sliding_window_size is None else sliding_window_size
+        )
+        # Stage1/global-attention mode processes the whole view set at once.
+        # In that case SDPA does not need the streaming KV cache; avoiding it
+        # saves the extra K/V graph references that make backbone training OOM.
+        use_full_batch_sdpa = (
+            self.use_sdpa
+            and effective_sliding_window_size == -1
+            and num_frame_per_block == S_global
+            and S_local == S_global
+        )
         intermediates = []
 
         for _ in range(self.aa_block_size):
             num_patches = P - self.num_special_tokens
 
             if self.use_sdpa:
-                # 【Backend A: SDPA】使用 dict-based KV cache
-                tokens = self.global_blocks[global_idx](
-                    tokens,
-                    pos=pos,
-                    enable_ulysses_cp=False,  # Context Parallelism 已禁用
-                    num_patches=num_patches,
-                    num_special=self.num_special_tokens,
-                    num_frames=num_frames,
-                    enable_3d_rope=self.enable_3d_rope,
-                    kv_cache=self.kv_cache,  # dict-based cache
-                    global_idx=global_idx,
-                    num_frame_per_block=num_frame_per_block,
-                    num_frame_for_scale=scale_frames,
-                    num_register_tokens=self.num_register_tokens,
-                )
+                # 【Backend A: SDPA】global full-batch 用普通 SDPA；streaming 才使用 dict cache
+                kv_cache = None if use_full_batch_sdpa else self.kv_cache
+                block = self.global_blocks[global_idx]
+                block_global_idx = global_idx
+
+                def _run_sdpa_global_block(x):
+                    return block(
+                        x,
+                        pos=pos,
+                        enable_ulysses_cp=False,  # Context Parallelism 已禁用
+                        num_patches=num_patches,
+                        num_special=self.num_special_tokens,
+                        num_frames=num_frames,
+                        enable_3d_rope=self.enable_3d_rope,
+                        kv_cache=kv_cache,
+                        global_idx=block_global_idx,
+                        num_frame_per_block=num_frame_per_block,
+                        num_frame_for_scale=scale_frames,
+                        num_register_tokens=self.num_register_tokens,
+                    )
+
+                if (
+                    use_full_batch_sdpa
+                    and self.training
+                    and self.use_gradient_checkpoint
+                    and tokens.requires_grad
+                ):
+                    from torch.utils.checkpoint import checkpoint
+                    tokens = checkpoint(
+                        _run_sdpa_global_block,
+                        tokens,
+                        use_reentrant=self.use_reentrant,
+                    )
+                else:
+                    tokens = _run_sdpa_global_block(tokens)
             else:
                 # 【Backend B: FlashInfer】使用分页 KV cache
                 # 懒初始化 FlashInfer manager（首次使用时创建）
