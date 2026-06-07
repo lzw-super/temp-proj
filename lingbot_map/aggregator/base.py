@@ -439,18 +439,22 @@ class AggregatorBase(nn.Module, ABC):
                 init_values=init_values,
             )
 
-            # Load pretrained weights
-            try:
-                ckpt = torch.load(pretrained_path)
-                del ckpt['pos_embed']
-                logger.info("Loading pretrained weights for DINOv2")
-                missing, unexpected = self.patch_embed.load_state_dict(ckpt, strict=False)
-                logger.info(f"Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+            # Load optional standalone DINOv2 weights. Full GCT checkpoints are
+            # loaded later by callers and intentionally leave this path empty.
+            if pretrained_path:
+                try:
+                    ckpt = torch.load(pretrained_path)
+                    del ckpt['pos_embed']
+                    logger.info("Loading pretrained weights for DINOv2")
+                    missing, unexpected = self.patch_embed.load_state_dict(ckpt, strict=False)
+                    logger.info(f"Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
 
-                # Store checkpoint for block initialization
-                self._dino_checkpoint = ckpt
-            except Exception as e:
-                logger.warning(f"Failed to load pretrained weights: {e}")
+                    # Store checkpoint for block initialization
+                    self._dino_checkpoint = ckpt
+                except Exception as e:
+                    logger.warning(f"Failed to load pretrained weights: {e}")
+                    self._dino_checkpoint = None
+            else:
                 self._dino_checkpoint = None
 
             # Disable gradients for mask token
