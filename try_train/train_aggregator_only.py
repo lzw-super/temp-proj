@@ -410,25 +410,56 @@ def train_one_iteration(
         trainable_params,
         args.gradient_clip_norm,
     )
-    if args.use_amp:
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        optimizer.step()
 
-    if not torch.isfinite(grad_norm) or float(grad_norm) <= 0:
+    grad_norm_value = float(grad_norm)
+    grad_is_finite = bool(torch.isfinite(grad_norm))
+
+    # Configuration sanity check: if the very first iteration produces zero
+    # gradient, the selected blocks are not connected to the loss. AMP can
+    # legitimately produce inf/nan grad norms on any later step (GradScaler
+    # will skip the step and reduce the loss scale), so we only enforce the
+    # >0 check on iteration 0 and only when the value is finite.
+    if args.iteration == 0 and grad_is_finite and grad_norm_value <= 0.0:
         raise RuntimeError(
-            "Selected blocks received no gradient. Choose a block connected to an "
-            "active depth/camera scale (recommended: --block_indices 17)."
+            "Selected blocks received no gradient on the first iteration. "
+            "Choose a block connected to an active depth/camera scale "
+            "(recommended: --block_indices 17)."
         )
 
-    scheduler.step()
+    skipped_step = False
+    if args.use_amp:
+        # scaler.step will internally skip optimizer.step() if any gradient is
+        # inf/nan; scaler.update() then reduces the loss scale accordingly.
+        prev_scale = scaler.get_scale()
+        scaler.step(optimizer)
+        scaler.update()
+        skipped_step = scaler.get_scale() < prev_scale
+        if skipped_step:
+            print(
+                f"[amp] Iter {args.iteration}: non-finite grad detected "
+                f"(grad_norm={grad_norm_value}); skipping optimizer step, "
+                f"loss scale {prev_scale:.1f} -> {scaler.get_scale():.1f}"
+            )
+    else:
+        if not grad_is_finite:
+            raise RuntimeError(
+                f"Non-finite gradient norm at iteration {args.iteration} "
+                f"without AMP loss scaling: {grad_norm_value}. Check loss "
+                f"weights and learning rate."
+            )
+        optimizer.step()
+
+    if not skipped_step:
+        scheduler.step()
+
+    # Report a finite, plottable grad norm even when the step was skipped.
+    logged_grad_norm = grad_norm_value if grad_is_finite else float("nan")
     return {
         "total": total_loss_value,
         "depth": float(depth_loss.detach()),
         "abs_pose": float(abs_pose_loss.detach()),
         "rel_pose": float(rel_pose_loss.detach()),
-        "grad_norm": float(grad_norm),
+        "grad_norm": logged_grad_norm,
     }
 
 
