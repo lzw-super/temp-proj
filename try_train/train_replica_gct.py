@@ -162,10 +162,11 @@ def forward_gct_heads_only(model, images):
 
     # Step 1: Aggregator forward (no grad, global attention)
     with torch.no_grad():
+        selected_idx = getattr(model, "selected_idx", [4, 11, 17, 23])
         model.clean_kv_cache()
         aggregated_tokens_list, patch_start_idx = model.aggregator(
             images,
-            selected_idx=[4, 11, 17, 23],
+            selected_idx=selected_idx,
             num_frame_for_scale=S,         # Stage1: 全部帧都做 bidirectional
             sliding_window_size=-1,        # Stage1: 无 GCA 窗口（全局注意力）
             num_frame_per_block=S,         # Stage1: 一次处理全部 views

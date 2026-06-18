@@ -41,6 +41,8 @@ class GCTStream(GCTBase):
         embed_dim: int = 1024,
         patch_embed: str = 'dinov2_vitl14_reg',
         pretrained_path: str = '',
+        aggregator_depth: int = 24,
+        selected_idx: Optional[List[int]] = None,
         disable_global_rope: bool = False,
         # Head configuration
         enable_camera: bool = True,
@@ -64,6 +66,8 @@ class GCTStream(GCTBase):
         # Camera head 3D RoPE (separate from aggregator 3D RoPE)
         enable_camera_3d_rope: bool = False,
         camera_rope_theta: float = 10000.0,
+        camera_trunk_depth: int = 4,
+        camera_num_heads: Optional[int] = None,
         # Scale token configuration (kept for checkpoint compat, ignored)
         use_scale_token: bool = True,
         # KV cache parameters
@@ -106,6 +110,9 @@ class GCTStream(GCTBase):
         """
         # Store stream-specific parameters before calling super().__init__()
         self.pretrained_path = pretrained_path
+        self.aggregator_depth = aggregator_depth
+        self.selected_idx = list(selected_idx) if selected_idx is not None else self._default_selected_idx(aggregator_depth)
+        self._validate_selected_idx(self.selected_idx, aggregator_depth)
         self.sliding_window_size = sliding_window_size
         self.num_frame_for_scale = num_frame_for_scale
         self.num_random_frames = num_random_frames
@@ -117,6 +124,8 @@ class GCTStream(GCTBase):
         # Camera head 3D RoPE settings
         self.enable_camera_3d_rope = enable_camera_3d_rope
         self.camera_rope_theta = camera_rope_theta
+        self.camera_trunk_depth = camera_trunk_depth
+        self.camera_num_heads = camera_num_heads
         # KV cache parameters
         self.kv_cache_sliding_window = kv_cache_sliding_window
         self.kv_cache_scale_frames = kv_cache_scale_frames
@@ -163,6 +172,7 @@ class GCTStream(GCTBase):
             num_heads=num_heads,
             patch_embed=self.patch_embed,
             pretrained_path=self.pretrained_path,
+            depth=self.aggregator_depth,
             disable_global_rope=self.disable_global_rope,
             sliding_window_size=self.sliding_window_size,
             num_frame_for_scale=self.num_frame_for_scale,
@@ -192,6 +202,8 @@ class GCTStream(GCTBase):
         """
         return CameraCausalHead(
             dim_in=2 * self.embed_dim,
+            trunk_depth=self.camera_trunk_depth,
+            num_heads=self.camera_num_heads if self.camera_num_heads is not None else 16,
             sliding_window_size=self.sliding_window_size,
             attend_to_scale_frames=self.attend_to_scale_frames,
             # KV cache parameters
@@ -228,12 +240,37 @@ class GCTStream(GCTBase):
         """
         aggregated_tokens_list, patch_start_idx = self.aggregator(
             images,
-            selected_idx=[4, 11, 17, 23],
+            selected_idx=self.selected_idx,
             num_frame_for_scale=num_frame_for_scale,
             sliding_window_size=sliding_window_size,
             num_frame_per_block=num_frame_per_block,
         )
         return aggregated_tokens_list, patch_start_idx
+
+    @staticmethod
+    def _default_selected_idx(aggregator_depth: int) -> List[int]:
+        """Default four feature taps for DPT-style heads."""
+        if aggregator_depth < 4:
+            raise ValueError("aggregator_depth must be at least 4 when using DPT heads")
+        if aggregator_depth == 24:
+            return [4, 11, 17, 23]
+        if aggregator_depth == 12:
+            return [2, 5, 8, 11]
+        return [
+            max(0, int(aggregator_depth * fraction) - 1)
+            for fraction in (0.25, 0.50, 0.75, 1.00)
+        ]
+
+    @staticmethod
+    def _validate_selected_idx(selected_idx: List[int], aggregator_depth: int) -> None:
+        if len(selected_idx) < 4:
+            raise ValueError("selected_idx must provide at least four feature taps for DPT heads")
+        invalid = [idx for idx in selected_idx if idx < 0 or idx >= aggregator_depth]
+        if invalid:
+            raise ValueError(
+                f"selected_idx contains out-of-range indices {invalid}; "
+                f"aggregator_depth={aggregator_depth}"
+            )
 
     def clean_kv_cache(self):
         """
