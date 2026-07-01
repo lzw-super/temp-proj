@@ -160,12 +160,12 @@ class CausalAttention(nn.Module):
         self.kv_cache_include_scale_frames = kv_cache_include_scale_frames
         self.kv_cache_camera_only = kv_cache_camera_only
 
-    def forward(self, x: Tensor, block_mask=None, pos=None, pos_kv=None, frame_seqlen=None, video_mask=None, kv_cache=None, current_start=0, current_end=0, global_idx=0, num_frame_per_block=1, num_frame_for_scale=-1, enable_3d_rope=False, sliding_window_size=-1, attend_to_scale_frames=False, num_random_frames=0, attend_to_special_tokens=False, num_register_tokens=4, enable_ulysses_cp=False, is_scale_frames=False) -> Tensor:
+    def forward(self, x: Tensor, block_mask=None, pos=None, pos_kv=None, frame_seqlen=None, video_mask=None, kv_cache=None, current_start=0, current_end=0, global_idx=0, num_frame_per_block=1, num_frame_for_scale=-1, enable_3d_rope=False, sliding_window_size=-1, attend_to_scale_frames=False, num_random_frames=0, attend_to_special_tokens=False, num_register_tokens=4, num_anchor_tokens=0, num_scale_tokens=1, enable_ulysses_cp=False, is_scale_frames=False) -> Tensor:
         B, N, C = x.shape
 
         # Calculate special token indices
         camera_token_idx = 0
-        scale_token_idx = camera_token_idx + num_register_tokens + 1  # camera + register tokens + scale
+        last_special_token_idx = camera_token_idx + num_register_tokens + num_anchor_tokens + num_scale_tokens
 
         # [3, B, num_heads, N, head_dim]
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -268,7 +268,14 @@ class CausalAttention(nn.Module):
 
                 # Apply sliding window eviction BEFORE attention to match causal_3drope behavior
                 # This ensures current frame only attends to frames within the sliding window
-                self._apply_kv_cache_eviction_causal(kv_cache, global_idx, camera_token_idx, scale_token_idx)
+                self._apply_kv_cache_eviction_causal(
+                    kv_cache,
+                    global_idx,
+                    camera_token_idx,
+                    last_special_token_idx,
+                    sliding_window_size=sliding_window_size,
+                    num_frame_for_scale=num_frame_for_scale,
+                )
 
                 # Retrieve full k, v from cache (already RoPE-applied, already evicted)
                 k = kv_cache[f"k_{global_idx}"].clone()
@@ -323,15 +330,31 @@ class CausalAttention(nn.Module):
         x = self.proj_drop(x)
         return x
 
-    def _apply_kv_cache_eviction_causal(self, kv_cache, global_idx, camera_token_idx, scale_token_idx):
+    def _apply_kv_cache_eviction_causal(
+        self,
+        kv_cache,
+        global_idx,
+        camera_token_idx,
+        last_special_token_idx,
+        sliding_window_size=None,
+        num_frame_for_scale=None,
+    ):
         """
         Apply sliding window eviction to KV cache BEFORE attention.
 
         This ensures current frame only attends to frames within the sliding window,
         matching the behavior of causal_3drope's attention mask.
         """
-        sliding_window_frames = self.kv_cache_sliding_window
-        scale_frames = self.kv_cache_scale_frames
+        sliding_window_frames = (
+            self.kv_cache_sliding_window
+            if sliding_window_size is None or sliding_window_size <= 0
+            else sliding_window_size
+        )
+        scale_frames = (
+            self.kv_cache_scale_frames
+            if num_frame_for_scale is None or num_frame_for_scale <= 0
+            else num_frame_for_scale
+        )
 
         if kv_cache[f"k_{global_idx}"].shape[3] > 1:
             num_cached_frames = kv_cache[f"k_{global_idx}"].shape[2]
@@ -350,10 +373,9 @@ class CausalAttention(nn.Module):
                             new_special_k = evicted_k[:, :, :, camera_token_idx:camera_token_idx+1, :].clone()
                             new_special_v = evicted_v[:, :, :, camera_token_idx:camera_token_idx+1, :].clone()
                         else:
-                            # Keep ALL special tokens (camera + register + scale) to match attention_mask behavior
-                            # Special tokens are in range [camera_token_idx, scale_token_idx+1)
-                            new_special_k = evicted_k[:, :, :, camera_token_idx:scale_token_idx+1, :].clone()
-                            new_special_v = evicted_v[:, :, :, camera_token_idx:scale_token_idx+1, :].clone()
+                            # Keep all context tokens before patch_start_idx.
+                            new_special_k = evicted_k[:, :, :, camera_token_idx:last_special_token_idx+1, :].clone()
+                            new_special_v = evicted_v[:, :, :, camera_token_idx:last_special_token_idx+1, :].clone()
 
                         if f"k_{global_idx}_special" not in kv_cache or kv_cache[f"k_{global_idx}_special"] is None:
                             kv_cache[f"k_{global_idx}_special"] = new_special_k
@@ -458,7 +480,9 @@ class FlashInferAttention(Attention):
                 num_patches=None, num_special=None, num_frames=None, enable_3d_rope=False,
                 # KV cache parameters (kv_cache is a FlashInferKVCacheManager or None)
                 kv_cache=None, global_idx=0, num_frame_per_block=1,
-                num_frame_for_scale=-1, num_register_tokens=4) -> Tensor:
+                num_frame_for_scale=-1, num_register_tokens=4,
+                num_anchor_tokens=0, num_scale_tokens=1,
+                sliding_window_size=None) -> Tensor:
         """
         Forward pass with FlashInfer paged KV cache and attention.
 
@@ -564,10 +588,20 @@ class FlashInferAttention(Attention):
                 for f_idx in range(num_frames):
                     s = f_idx * tpf
                     manager.append_frame(global_idx, k_all[s:s+tpf].contiguous(), v_all[s:s+tpf].contiguous())
+                    effective_sliding_window = (
+                        self.kv_cache_sliding_window
+                        if sliding_window_size is None or sliding_window_size <= 0
+                        else sliding_window_size
+                    )
+                    effective_scale_frames = (
+                        self.kv_cache_scale_frames
+                        if num_frame_for_scale is None or num_frame_for_scale <= 0
+                        else num_frame_for_scale
+                    )
                     manager.evict_frames(
                         block_idx=global_idx,
-                        scale_frames=self.kv_cache_scale_frames,
-                        sliding_window=self.kv_cache_sliding_window,
+                        scale_frames=effective_scale_frames,
+                        sliding_window=effective_sliding_window,
                         cross_frame_special=self.kv_cache_cross_frame_special,
                         include_scale_frames=self.kv_cache_include_scale_frames,
                         camera_only=self.kv_cache_camera_only,
@@ -581,10 +615,20 @@ class FlashInferAttention(Attention):
                 manager.append_frame(global_idx, k_nhd, v_nhd)
 
                 # 2. Apply sliding window eviction
+                effective_sliding_window = (
+                    self.kv_cache_sliding_window
+                    if sliding_window_size is None or sliding_window_size <= 0
+                    else sliding_window_size
+                )
+                effective_scale_frames = (
+                    self.kv_cache_scale_frames
+                    if num_frame_for_scale is None or num_frame_for_scale <= 0
+                    else num_frame_for_scale
+                )
                 manager.evict_frames(
                     block_idx=global_idx,
-                    scale_frames=self.kv_cache_scale_frames,
-                    sliding_window=self.kv_cache_sliding_window,
+                    scale_frames=effective_scale_frames,
+                    sliding_window=effective_sliding_window,
                     cross_frame_special=self.kv_cache_cross_frame_special,
                     include_scale_frames=self.kv_cache_include_scale_frames,
                     camera_only=self.kv_cache_camera_only,
@@ -641,7 +685,9 @@ class SDPAAttention(Attention):
     def forward(self, x: Tensor, pos=None, enable_ulysses_cp=False,
                 num_patches=None, num_special=None, num_frames=None, enable_3d_rope=False,
                 kv_cache=None, global_idx=0, num_frame_per_block=1,
-                num_frame_for_scale=-1, num_register_tokens=4) -> Tensor:
+                num_frame_for_scale=-1, num_register_tokens=4,
+                num_anchor_tokens=0, num_scale_tokens=1,
+                sliding_window_size=None) -> Tensor:
         B, N, C = x.shape
         using_optimized_layout = (num_patches is not None and num_special is not None
                                  and num_frames is not None)
@@ -675,7 +721,12 @@ class SDPAAttention(Attention):
                 k = apply_rotary_emb(k, pos)
 
             camera_token_idx = 0
-            scale_token_idx = camera_token_idx + num_register_tokens + 1
+            last_special_token_idx = (
+                camera_token_idx
+                + num_register_tokens
+                + num_anchor_tokens
+                + num_scale_tokens
+            )
 
             if kv_cache[f"k_{global_idx}"] is None:
                 kv_cache[f"k_{global_idx}"] = k.view(B, self.num_heads, num_frame_per_block,
@@ -694,7 +745,13 @@ class SDPAAttention(Attention):
                 ), dim=2)
 
             self._apply_kv_cache_eviction(
-                kv_cache, global_idx, camera_token_idx, scale_token_idx, num_register_tokens
+                kv_cache,
+                global_idx,
+                camera_token_idx,
+                last_special_token_idx,
+                num_register_tokens,
+                sliding_window_size=sliding_window_size,
+                num_frame_for_scale=num_frame_for_scale,
             )
 
             k_cached = kv_cache[f"k_{global_idx}"].clone()
@@ -721,10 +778,27 @@ class SDPAAttention(Attention):
         x = self.proj_drop(x)
         return x
 
-    def _apply_kv_cache_eviction(self, kv_cache, global_idx, camera_token_idx, scale_token_idx, num_register_tokens):
+    def _apply_kv_cache_eviction(
+        self,
+        kv_cache,
+        global_idx,
+        camera_token_idx,
+        last_special_token_idx,
+        num_register_tokens,
+        sliding_window_size=None,
+        num_frame_for_scale=None,
+    ):
         """Apply sliding window eviction to KV cache."""
-        sliding_window_frames = self.kv_cache_sliding_window
-        scale_frames = self.kv_cache_scale_frames
+        sliding_window_frames = (
+            self.kv_cache_sliding_window
+            if sliding_window_size is None or sliding_window_size <= 0
+            else sliding_window_size
+        )
+        scale_frames = (
+            self.kv_cache_scale_frames
+            if num_frame_for_scale is None or num_frame_for_scale <= 0
+            else num_frame_for_scale
+        )
 
         if kv_cache[f"k_{global_idx}"].shape[3] > 1:
             num_cached_frames = kv_cache[f"k_{global_idx}"].shape[2]
@@ -740,8 +814,8 @@ class SDPAAttention(Attention):
                             new_special_k = evicted_k[:, :, :, camera_token_idx:camera_token_idx+1, :].clone()
                             new_special_v = evicted_v[:, :, :, camera_token_idx:camera_token_idx+1, :].clone()
                         else:
-                            new_special_k = evicted_k[:, :, :, camera_token_idx:scale_token_idx+1, :].clone()
-                            new_special_v = evicted_v[:, :, :, camera_token_idx:scale_token_idx+1, :].clone()
+                            new_special_k = evicted_k[:, :, :, camera_token_idx:last_special_token_idx+1, :].clone()
+                            new_special_v = evicted_v[:, :, :, camera_token_idx:last_special_token_idx+1, :].clone()
 
                         if f"k_{global_idx}_special" not in kv_cache or kv_cache[f"k_{global_idx}_special"] is None:
                             kv_cache[f"k_{global_idx}_special"] = new_special_k

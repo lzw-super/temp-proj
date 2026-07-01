@@ -50,6 +50,7 @@ class GCTStream(GCTBase):
         enable_local_point: bool = False,
         enable_depth: bool = True,
         enable_track: bool = False,
+        enable_camera_sliding_window: bool = False,
         # Normalization
         enable_normalize: bool = False,
         # Prediction normalization
@@ -68,7 +69,8 @@ class GCTStream(GCTBase):
         camera_rope_theta: float = 10000.0,
         camera_trunk_depth: int = 4,
         camera_num_heads: Optional[int] = None,
-        # Scale token configuration (kept for checkpoint compat, ignored)
+        # Streaming context token configuration
+        use_anchor_token: bool = False,
         use_scale_token: bool = True,
         # KV cache parameters
         kv_cache_sliding_window: int = 64,
@@ -101,7 +103,8 @@ class GCTStream(GCTBase):
             enable_stream_inference: Enable streaming inference with KV cache
             enable_3d_rope: Enable 3D RoPE for temporal consistency
             max_frame_num: Maximum number of frames for 3D RoPE
-            use_scale_token: Kept for checkpoint compatibility, ignored
+            use_anchor_token: Add a learnable anchor token for GCA anchor context
+            use_scale_token: Add the legacy learnable scale token
             kv_cache_sliding_window: Sliding window size for KV cache eviction
             kv_cache_scale_frames: Number of scale frames to keep in KV cache
             kv_cache_cross_frame_special: Keep special tokens from evicted frames
@@ -121,6 +124,8 @@ class GCTStream(GCTBase):
         self.enable_stream_inference = enable_stream_inference
         self.enable_3d_rope = enable_3d_rope
         self.max_frame_num = max_frame_num
+        self.use_anchor_token = use_anchor_token
+        self.use_scale_token = use_scale_token
         # Camera head 3D RoPE settings
         self.enable_camera_3d_rope = enable_camera_3d_rope
         self.camera_rope_theta = camera_rope_theta
@@ -146,6 +151,7 @@ class GCTStream(GCTBase):
             enable_local_point=enable_local_point,
             enable_depth=enable_depth,
             enable_track=enable_track,
+            enable_camera_sliding_window=enable_camera_sliding_window,
             enable_normalize=enable_normalize,
             pred_normalization=pred_normalization,
             enable_3d_rope=enable_3d_rope,
@@ -182,6 +188,8 @@ class GCTStream(GCTBase):
             enable_stream_inference=self.enable_stream_inference,
             enable_3d_rope=self.enable_3d_rope,
             max_frame_num=self.max_frame_num,
+            use_anchor_token=self.use_anchor_token,
+            use_scale_token=self.use_scale_token,
             # Backend: FlashInfer (default) or SDPA (fallback)
             use_flashinfer=not self.use_sdpa,
             use_sdpa=self.use_sdpa,

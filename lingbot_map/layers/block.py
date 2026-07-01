@@ -240,6 +240,9 @@ class FlashInferBlock(nn.Module):
         num_frame_per_block=1,
         num_frame_for_scale=-1,
         num_register_tokens=4,
+        num_anchor_tokens=0,
+        num_scale_tokens=1,
+        sliding_window_size=None,
     ) -> Tensor:
         # Phase 2 (streaming): single-frame FlashInfer paged attention.
         # Handle inline so attn_pre (norm1+prepare_qkv) can be compiled as one CUDA graph.
@@ -251,10 +254,20 @@ class FlashInferBlock(nn.Module):
             # Eager: write frame K/V to paged cache
             manager.append_frame(global_idx, k_nhd, v_nhd)
             # CPU-only: update eviction state (deque ops, no GPU kernel)
+            effective_sliding_window = (
+                self.attn.kv_cache_sliding_window
+                if sliding_window_size is None or sliding_window_size <= 0
+                else sliding_window_size
+            )
+            effective_scale_frames = (
+                self.attn.kv_cache_scale_frames
+                if num_frame_for_scale is None or num_frame_for_scale <= 0
+                else num_frame_for_scale
+            )
             manager.evict_frames(
                 block_idx=global_idx,
-                scale_frames=self.attn.kv_cache_scale_frames,
-                sliding_window=self.attn.kv_cache_sliding_window,
+                scale_frames=effective_scale_frames,
+                sliding_window=effective_sliding_window,
                 cross_frame_special=self.attn.kv_cache_cross_frame_special,
                 include_scale_frames=self.attn.kv_cache_include_scale_frames,
                 camera_only=self.attn.kv_cache_camera_only,
@@ -283,6 +296,9 @@ class FlashInferBlock(nn.Module):
                 num_frame_per_block=num_frame_per_block,
                 num_frame_for_scale=num_frame_for_scale,
                 num_register_tokens=num_register_tokens,
+                num_anchor_tokens=num_anchor_tokens,
+                num_scale_tokens=num_scale_tokens,
+                sliding_window_size=sliding_window_size,
             ))
         x = self.ffn_residual(x)
         return x
@@ -492,7 +508,9 @@ class SDPABlock(nn.Module):
     def forward(self, x: Tensor, pos=None, enable_ulysses_cp=False,
                 num_patches=None, num_special=None, num_frames=None, enable_3d_rope=False,
                 kv_cache=None, global_idx=0, num_frame_per_block=1,
-                num_frame_for_scale=-1, num_register_tokens=4) -> Tensor:
+                num_frame_for_scale=-1, num_register_tokens=4,
+                num_anchor_tokens=0, num_scale_tokens=1,
+                sliding_window_size=None) -> Tensor:
         def attn_residual_func(x, pos=None):
             return self.ls1(self.attn(
                 self.norm1(x), pos=pos, enable_ulysses_cp=enable_ulysses_cp,
@@ -500,6 +518,9 @@ class SDPABlock(nn.Module):
                 enable_3d_rope=enable_3d_rope, kv_cache=kv_cache, global_idx=global_idx,
                 num_frame_per_block=num_frame_per_block, num_frame_for_scale=num_frame_for_scale,
                 num_register_tokens=num_register_tokens,
+                num_anchor_tokens=num_anchor_tokens,
+                num_scale_tokens=num_scale_tokens,
+                sliding_window_size=sliding_window_size,
             ))
 
         def ffn_residual_func(x):

@@ -1,4 +1,4 @@
-"""LZW-Map lightweight Stage1 model builders and parameter summaries."""
+"""LZW-Map lightweight model builders and parameter summaries."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from lingbot_map.models.gct_stream import GCTStream
 
 
 LZW_MAP_STAGE1_SELECTED_IDX = [2, 5, 8, 11]
+LZW_MAP_STAGE2_SELECTED_IDX = list(LZW_MAP_STAGE1_SELECTED_IDX)
 
 
 class LZWMapStage1(GCTStream):
@@ -60,6 +61,41 @@ class LZWMapStage1(GCTStream):
         super().__init__(**defaults)
 
 
+class LZWMapStage2(LZWMapStage1):
+    """Stage2-ready lightweight LZW-Map model.
+
+    Stage2 keeps the same ViT-B/12-block student architecture as Stage1, but
+    raises the temporal capacity for long foldback sequences and switches the
+    streaming context token layout to camera + registers + anchor.
+    """
+
+    model_name = "lzw-map-stage2"
+
+    def __init__(
+        self,
+        pretrained_path: str = "",
+        enable_point: bool = False,
+        use_sdpa: bool = True,
+        max_frame_num: int = 400,
+        kv_cache_sliding_window: int = 64,
+        kv_cache_scale_frames: int = 8,
+        **kwargs,
+    ) -> None:
+        kwargs.setdefault("selected_idx", list(LZW_MAP_STAGE2_SELECTED_IDX))
+        kwargs.setdefault("enable_camera_sliding_window", True)
+        kwargs.setdefault("use_anchor_token", True)
+        kwargs.setdefault("use_scale_token", False)
+        super().__init__(
+            pretrained_path=pretrained_path,
+            enable_point=enable_point,
+            use_sdpa=use_sdpa,
+            max_frame_num=max_frame_num,
+            kv_cache_sliding_window=kv_cache_sliding_window,
+            kv_cache_scale_frames=kv_cache_scale_frames,
+            **kwargs,
+        )
+
+
 def create_lzw_map_stage1(
     pretrained_path: str = "",
     enable_point: bool = False,
@@ -71,6 +107,27 @@ def create_lzw_map_stage1(
         pretrained_path=pretrained_path,
         enable_point=enable_point,
         use_sdpa=use_sdpa,
+        **kwargs,
+    )
+
+
+def create_lzw_map_stage2(
+    pretrained_path: str = "",
+    enable_point: bool = False,
+    use_sdpa: bool = True,
+    max_frame_num: int = 400,
+    kv_cache_sliding_window: int = 64,
+    kv_cache_scale_frames: int = 8,
+    **kwargs,
+) -> LZWMapStage2:
+    """Create the default lightweight LZW-Map Stage2 model."""
+    return LZWMapStage2(
+        pretrained_path=pretrained_path,
+        enable_point=enable_point,
+        use_sdpa=use_sdpa,
+        max_frame_num=max_frame_num,
+        kv_cache_sliding_window=kv_cache_sliding_window,
+        kv_cache_scale_frames=kv_cache_scale_frames,
         **kwargs,
     )
 
@@ -113,7 +170,7 @@ def lzw_map_parameter_summary(model: nn.Module) -> "OrderedDict[str, Dict[str, i
         rows["aggregator.frame_blocks"] = _module_stats(getattr(aggregator, "frame_blocks", None))
         rows["aggregator.global_blocks"] = _module_stats(getattr(aggregator, "global_blocks", None))
 
-        special_token_names = {"camera_token", "register_token", "scale_token"}
+        special_token_names = {"camera_token", "register_token", "anchor_token", "scale_token"}
         rows["aggregator.special_tokens"] = _parameter_stats(
             param
             for name, param in aggregator.named_parameters(recurse=False)

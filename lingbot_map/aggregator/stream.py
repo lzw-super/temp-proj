@@ -155,6 +155,8 @@ class AggregatorStream(AggregatorBase):
         attend_to_scale_frames: bool = False,    # 包含scale frames
         enable_3d_rope: bool = False,            # 3D RoPE
         max_frame_num: int = 1024,               # 最大帧数
+        use_anchor_token: bool = False,          # Stage2 GCA anchor token
+        use_scale_token: bool = True,            # Legacy scale token
         # KV cache parameters (KV cache参数)
         kv_cache_sliding_window: int = 64,       # 滑动窗口（帧数）
         kv_cache_scale_frames: int = 8,          # scale frames数
@@ -209,6 +211,8 @@ class AggregatorStream(AggregatorBase):
         self.attend_to_scale_frames = attend_to_scale_frames
         self.enable_3d_rope = enable_3d_rope
         self.max_frame_num = max_frame_num
+        self.use_anchor_token = use_anchor_token
+        self.use_scale_token = use_scale_token
 
         # ════════════════════════════════════════════════════════════════════
         # 存储 KV cache 参数
@@ -288,7 +292,7 @@ class AggregatorStream(AggregatorBase):
         ])
 
     def _setup_special_tokens(self):
-        """Setup camera, register, and scale tokens for causal mode."""
+        """Setup camera, register, anchor, and/or scale tokens for causal mode."""
         # Camera token
         self.camera_token = nn.Parameter(
             torch.randn(1, 2, 1, self.embed_dim)
@@ -300,20 +304,36 @@ class AggregatorStream(AggregatorBase):
                 torch.randn(1, 2, self.num_register_tokens, self.embed_dim)
             )
 
-        # Scale token (causal mode specific)
-        self.scale_token = nn.Parameter(
-            torch.ones(1, 2, 1, self.embed_dim)
-        )
+        if self.use_anchor_token:
+            self.anchor_token = nn.Parameter(
+                torch.ones(1, 2, 1, self.embed_dim)
+            )
+
+        if self.use_scale_token:
+            self.scale_token = nn.Parameter(
+                torch.ones(1, 2, 1, self.embed_dim)
+            )
 
         # Initialize
         nn.init.normal_(self.camera_token, std=1e-6)
         if self.num_register_tokens > 0:
             nn.init.normal_(self.register_token, std=1e-6)
-        nn.init.normal_(self.scale_token, std=1e-6)
+        if self.use_anchor_token:
+            nn.init.normal_(self.anchor_token, std=1e-6)
+        if self.use_scale_token:
+            nn.init.normal_(self.scale_token, std=1e-6)
 
-        # Token indexing (includes scale token)
-        self.patch_start_idx = 1 + self.num_register_tokens + 1  # camera + register + scale
-        self.num_special_tokens = 1 + self.num_register_tokens + 1
+        # Token indexing:
+        # camera + register + optional anchor + optional scale + patches.
+        self.num_anchor_tokens = 1 if self.use_anchor_token else 0
+        self.num_scale_tokens = 1 if self.use_scale_token else 0
+        self.patch_start_idx = (
+            1
+            + self.num_register_tokens
+            + self.num_anchor_tokens
+            + self.num_scale_tokens
+        )
+        self.num_special_tokens = self.patch_start_idx
 
     def _init_kv_cache(self):
         """
@@ -663,7 +683,7 @@ class AggregatorStream(AggregatorBase):
         num_frame_for_scale: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Prepare camera, register, and scale tokens.
+        Prepare camera, register, anchor, and/or scale tokens.
 
         Args:
             B: Batch size
@@ -699,26 +719,58 @@ class AggregatorStream(AggregatorBase):
             # Streaming mode: expand with S_true, then slice to get current frames
             effective_scale_frames = min(scale_frames, S_true)
 
-            camera_token_full = slice_expand_and_flatten(self.camera_token, B, S_true)
-            camera_token = camera_token_full[-S_global:, :, :]
-
-            register_token_full = slice_expand_and_flatten(self.register_token, B, S_true)
-            register_token = register_token_full[-S_global:, :, :]
-            scale_token_full = slice_expand_and_flatten(
-                self.scale_token, B, S_true, first_num_frame=effective_scale_frames
-            )
-            scale_token = scale_token_full[-S_global:, :, :]
+            special_tokens = [
+                slice_expand_and_flatten(self.camera_token, B, S_true)[-S_global:, :, :]
+            ]
+            if self.num_register_tokens > 0:
+                special_tokens.append(
+                    slice_expand_and_flatten(self.register_token, B, S_true)[-S_global:, :, :]
+                )
+            if self.use_anchor_token:
+                special_tokens.append(
+                    slice_expand_and_flatten(
+                        self.anchor_token,
+                        B,
+                        S_true,
+                        first_num_frame=effective_scale_frames,
+                    )[-S_global:, :, :]
+                )
+            if self.use_scale_token:
+                special_tokens.append(
+                    slice_expand_and_flatten(
+                        self.scale_token,
+                        B,
+                        S_true,
+                        first_num_frame=effective_scale_frames,
+                    )[-S_global:, :, :]
+                )
         else:
             # Batch mode or first inference: expand directly
             effective_scale_frames = min(scale_frames, S_global)
 
-            camera_token = slice_expand_and_flatten(self.camera_token, B, S_global)
-            register_token = slice_expand_and_flatten(self.register_token, B, S_global)
-            scale_token = slice_expand_and_flatten(
-                self.scale_token, B, S_global, first_num_frame=effective_scale_frames
-            )
+            special_tokens = [slice_expand_and_flatten(self.camera_token, B, S_global)]
+            if self.num_register_tokens > 0:
+                special_tokens.append(slice_expand_and_flatten(self.register_token, B, S_global))
+            if self.use_anchor_token:
+                special_tokens.append(
+                    slice_expand_and_flatten(
+                        self.anchor_token,
+                        B,
+                        S_global,
+                        first_num_frame=effective_scale_frames,
+                    )
+                )
+            if self.use_scale_token:
+                special_tokens.append(
+                    slice_expand_and_flatten(
+                        self.scale_token,
+                        B,
+                        S_global,
+                        first_num_frame=effective_scale_frames,
+                    )
+                )
 
-        special_tokens = torch.cat([camera_token, register_token, scale_token], dim=1)
+        special_tokens = torch.cat(special_tokens, dim=1)
 
         # Verify shape
         expected_shape = (B * S_global, self.num_special_tokens, C)
@@ -1227,6 +1279,9 @@ class AggregatorStream(AggregatorBase):
                         num_frame_per_block=num_frame_per_block,
                         num_frame_for_scale=scale_frames,
                         num_register_tokens=self.num_register_tokens,
+                        num_anchor_tokens=self.num_anchor_tokens,
+                        num_scale_tokens=self.num_scale_tokens,
+                        sliding_window_size=effective_sliding_window_size,
                     )
 
                 if (
@@ -1260,6 +1315,9 @@ class AggregatorStream(AggregatorBase):
                     num_frame_per_block=num_frame_per_block,
                     num_frame_for_scale=scale_frames,
                     num_register_tokens=self.num_register_tokens,
+                    num_anchor_tokens=self.num_anchor_tokens,
+                    num_scale_tokens=self.num_scale_tokens,
+                    sliding_window_size=effective_sliding_window_size,
                 )
 
             # 更新 block 索引
