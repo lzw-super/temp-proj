@@ -21,6 +21,7 @@ video_data/
 video_data_* 
 *.png
 *.pt 
+*.pth
 checkpoints
 comparison_results 
 token_comparison_results 
