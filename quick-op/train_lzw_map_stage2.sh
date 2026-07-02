@@ -140,7 +140,8 @@ fi
 echo "========================================================================"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-conda run -n lingbot-map --no-capture-output python try_train/train_lzw_map_stage2.py \
+PYTHONUNBUFFERED=1 \
+conda run -n lingbot-map --no-capture-output python -u try_train/train_lzw_map_stage2.py \
   --data_root "${DATA_ROOT}" \
   --dinov2_repo "${DINOV2_REPO}" \
   --stage1_checkpoint "${STAGE1_CKPT}" \
