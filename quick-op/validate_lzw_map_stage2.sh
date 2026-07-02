@@ -30,13 +30,16 @@
 #   - Stage2 validation 固定使用 temporal_nearby、无数据增强、max_dim=518。
 #   - 位姿指标会输出 Official XYZW AUC@3/5/15/30、Racc/Tacc、Sim(3) ATE 和 RPE；
 #     AUC 越高越好，ATE/RPE 越低越好。
+#   - scale_aligned_abs/rel_pose_loss 使用官方 XYZW loss；legacy_wxyz_* 仅作为旧 loss 诊断。
+#   - Stage2 的 pose anchor-scale norm 是训练期选项；验证时不用额外开关，
+#     只需传入对应 poseNorm1/poseNorm0 checkpoint 路径。
 
 set -e
 
 DATA_ROOT="/home/shared_files/datasets/dovsg/Replica/room0"  # 可改：Replica 验证数据路径
 ORIGINAL_MODEL="/home/shared_files/model_weights/linbo_map/lingbot-map.pt"  # 可改：原始 LingBot-Map 权重
 DINOV2_REPO="${DINOV2_REPO:-/home/lizhengwu/desktop/temp_proj/dinov2}"  # 可改：也可用环境变量覆盖
-DEFAULT_STAGE2_CKPT="try_train/checkpoints/lzw_map_stage2_full_15-20_k4-8_5000iters/checkpoint_final.pt"  # 可改：默认 Stage2 checkpoint
+DEFAULT_STAGE2_CKPT="try_train/checkpoints/lzw_map_stage2_full_15-20_k4-8_xyzw_poseNorm1_5000iters/checkpoint_final.pt"  # 可改：默认 Stage2 checkpoint
 
 NUM_SAMPLES=${1:-20}  # 可改：验证样本数；快速检查可 5/10，正式对比建议 20+
 STAGE2_CKPT=${2:-"${DEFAULT_STAGE2_CKPT}"}  # 可改：Stage2 checkpoint

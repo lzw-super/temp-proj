@@ -17,6 +17,7 @@
 #   - Stage1 validation 固定使用 temporal_nearby、无数据增强、max_dim=518。
 #   - 位姿指标会输出 Official XYZW AUC@3/5/15/30、Racc/Tacc、Sim(3) ATE 和 RPE；
 #     AUC 越高越好，ATE/RPE 越低越好。
+#   - scale_aligned_abs/rel_pose_loss 使用官方 XYZW loss；legacy_wxyz_* 仅作为旧 loss 诊断。
 #   - NUM_VIEWS < 3 时 Sim(3) ATE 和 pairwise AUC 统计都较弱，位姿更建议看 Official XYZW RPE 指标。
 
 set -e
@@ -25,7 +26,7 @@ DATA_ROOT="/home/shared_files/datasets/dovsg/Replica/room0"  # 可改：Replica 
 ORIGINAL_MODEL="/home/shared_files/model_weights/linbo_map/lingbot-map.pt"  # 可改：原始 LingBot-Map 权重
 DINOV2_REPO="${DINOV2_REPO:-/home/lizhengwu/desktop/temp_proj/dinov2}"  # 可改：也可用环境变量覆盖
 NUM_SAMPLES=${1:-20}  # 可改：验证样本数；快速检查可 5/10，正式对比建议 20+
-TRAINED_CKPT=${2:-"try_train/checkpoints/lzw_map_stage1_frozen_dinov2_2-20_spatial_nearby_5000iters/checkpoint_final.pt"}  # 可改：Stage1 checkpoint
+TRAINED_CKPT=${2:-"try_train/checkpoints/lzw_map_stage1_frozen_dinov2_2-20_spatial_nearby_xyzw_5000iters/checkpoint_final.pt"}  # 可改：Stage1 checkpoint
 NUM_VIEWS=${3:-20}  # 可改：每个样本 views；建议与训练上限或目标推理 views 对齐
 NUM_VIS=${4:-5}  # 可改：保存可视化样本数；不影响指标
 

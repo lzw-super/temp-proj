@@ -118,11 +118,15 @@ def evaluate_model(
     num_frame_for_scale,
 ):
     depth_loss_fn = DepthLoss(loss_type="masked_log_l1")
-    pose_loss_fn = PoseLoss()
-    rel_pose_loss_fn = RelativePoseLoss()
+    official_pose_loss_fn = PoseLoss(quat_convention="xyzw")
+    official_rel_pose_loss_fn = RelativePoseLoss(quat_convention="xyzw")
+    legacy_pose_loss_fn = PoseLoss(quat_convention="wxyz")
+    legacy_rel_pose_loss_fn = RelativePoseLoss(quat_convention="wxyz")
     metrics = {
         "metric_depth_loss": [],
         "scale_aligned_depth_loss": [],
+        "official_xyzw_scale_aligned_abs_pose_loss": [],
+        "official_xyzw_scale_aligned_rel_pose_loss": [],
         "legacy_wxyz_scale_aligned_abs_pose_loss": [],
         "legacy_wxyz_scale_aligned_rel_pose_loss": [],
         "scale_aligned_abs_pose_loss": [],
@@ -172,16 +176,20 @@ def evaluate_model(
 
         metric_depth_loss = depth_loss_fn(depth_pred, depths, masks)
         aligned_depth_loss = depth_loss_fn(aligned_depth, depths, masks)
-        abs_pose_loss = pose_loss_fn(aligned_pose, poses.float())
-        rel_pose_loss = rel_pose_loss_fn(aligned_pose, poses.float())
+        official_abs_pose_loss = official_pose_loss_fn(aligned_pose, poses.float())
+        official_rel_pose_loss = official_rel_pose_loss_fn(aligned_pose, poses.float())
+        legacy_abs_pose_loss = legacy_pose_loss_fn(aligned_pose, poses.float())
+        legacy_rel_pose_loss = legacy_rel_pose_loss_fn(aligned_pose, poses.float())
         pose_metrics = compute_pose_metrics(predictions["pose_enc"].float(), poses.float())
 
         metrics["metric_depth_loss"].append(float(metric_depth_loss))
         metrics["scale_aligned_depth_loss"].append(float(aligned_depth_loss))
-        metrics["legacy_wxyz_scale_aligned_abs_pose_loss"].append(float(abs_pose_loss))
-        metrics["legacy_wxyz_scale_aligned_rel_pose_loss"].append(float(rel_pose_loss))
-        metrics["scale_aligned_abs_pose_loss"].append(float(abs_pose_loss))
-        metrics["scale_aligned_rel_pose_loss"].append(float(rel_pose_loss))
+        metrics["official_xyzw_scale_aligned_abs_pose_loss"].append(float(official_abs_pose_loss))
+        metrics["official_xyzw_scale_aligned_rel_pose_loss"].append(float(official_rel_pose_loss))
+        metrics["legacy_wxyz_scale_aligned_abs_pose_loss"].append(float(legacy_abs_pose_loss))
+        metrics["legacy_wxyz_scale_aligned_rel_pose_loss"].append(float(legacy_rel_pose_loss))
+        metrics["scale_aligned_abs_pose_loss"].append(float(official_abs_pose_loss))
+        metrics["scale_aligned_rel_pose_loss"].append(float(official_rel_pose_loss))
         for metric_name, metric_value in pose_metrics.items():
             metrics.setdefault(metric_name, []).append(metric_value)
 
@@ -194,8 +202,10 @@ def evaluate_model(
             "sample_idx": sample_idx,
             "frame_ids": [int(frame_id) for frame_id in frame_ids],
             **pose_metrics,
-            "legacy_wxyz_scale_aligned_abs_pose_loss": float(abs_pose_loss),
-            "legacy_wxyz_scale_aligned_rel_pose_loss": float(rel_pose_loss),
+            "official_xyzw_scale_aligned_abs_pose_loss": float(official_abs_pose_loss),
+            "official_xyzw_scale_aligned_rel_pose_loss": float(official_rel_pose_loss),
+            "legacy_wxyz_scale_aligned_abs_pose_loss": float(legacy_abs_pose_loss),
+            "legacy_wxyz_scale_aligned_rel_pose_loss": float(legacy_rel_pose_loss),
         })
 
         print(
@@ -206,7 +216,9 @@ def evaluate_model(
             f"auc30={pose_metrics['pose_xyzw_auc30']:.2f} "
             f"ate={pose_metrics['pose_ate_sim3_rmse_m']:.4f}m "
             f"xyzw_rpeR={pose_metrics['pose_xyzw_rpe_rot_mean_deg']:.2f}deg "
-            f"xyzw_rpeT={pose_metrics['pose_xyzw_rpe_trans_rmse_m']:.4f}m"
+            f"xyzw_rpeT={pose_metrics['pose_xyzw_rpe_trans_rmse_m']:.4f}m "
+            f"xyzw_abs={float(official_abs_pose_loss):.4f} "
+            f"legacy_abs={float(legacy_abs_pose_loss):.4f}"
         )
 
     averaged = {key: float(np.mean(values)) for key, values in metrics.items()}
@@ -322,6 +334,16 @@ def main():
     ckpt_args = checkpoint.get("args", {})
     seed = int(ckpt_args.get("seed", 42))
     arch = checkpoint.get("architecture", {})
+    trained_pose_quat_convention = (
+        ckpt_args.get("pose_quat_convention")
+        or arch.get("pose_quat_convention")
+        or "unknown"
+    )
+    trained_pose_anchor_scale_norm = (
+        ckpt_args.get("use_pose_anchor_scale_norm")
+        if "use_pose_anchor_scale_norm" in ckpt_args
+        else arch.get("use_pose_anchor_scale_norm", "unknown")
+    )
     dinov2_repo = args.dinov2_repo or arch.get("dinov2_repo") or DEFAULT_DINOV2_REPO
     dinov2_hub_name = args.dinov2_hub_name or arch.get("dinov2_hub_name") or "dinov2_vitb14_reg"
 
@@ -346,6 +368,8 @@ def main():
     print("=" * 72)
     print(f"  LingBot original: {args.original_model}")
     print(f"  LZW Stage2:       {args.stage2_checkpoint}")
+    print(f"  Trained pose q:   {trained_pose_quat_convention}")
+    print(f"  Pose anchor norm: {trained_pose_anchor_scale_norm}")
     print(f"  DINOv2 repo:      {dinov2_repo}")
     print(f"  Samples/views:    {args.num_samples}/{args.num_views}")
     print(f"  GCA k / anchors:  {args.stage2_sliding_window}/{args.stage2_num_frame_for_scale}")
@@ -427,6 +451,8 @@ def main():
             "stage2_checkpoint": args.stage2_checkpoint,
             "iteration": loaded_checkpoint.get("iteration", checkpoint.get("iteration")),
             "seed": seed,
+            "trained_pose_quat_convention": trained_pose_quat_convention,
+            "trained_pose_anchor_scale_norm": trained_pose_anchor_scale_norm,
             "dinov2_repo": dinov2_repo,
             "dinov2_hub_name": dinov2_hub_name,
             "num_samples": args.num_samples,
@@ -437,6 +463,7 @@ def main():
             "depth_alignment": "per-view GT median scale",
             "pose_alignment": {
                 "ate": "Umeyama Sim(3) alignment of predicted camera centers to GT centers",
+                "scale_aligned_loss": "official XYZW PoseLoss/RelativePoseLoss; legacy_wxyz_* is diagnostic only",
                 "auc": (
                     "pairwise relative-pose AUC@{3,5,15,30} in percent; C2W poses are converted "
                     "to W2C, aligned to the first camera, then scored by max(rotation angular error, "
