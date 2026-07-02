@@ -42,6 +42,7 @@ from head_only_model import (
     DepthLoss,
     PoseLoss,
 )
+from lingbot_map.utils.rotation import quat_to_mat
 
 
 def _se3_inv(T: torch.Tensor) -> torch.Tensor:
@@ -69,10 +70,19 @@ class LocalRelativePoseLoss(torch.nn.Module):
     - 减少长序列全pair计算的计算量
     """
 
-    def __init__(self, rotation_weight=1.0, translation_weight=10.0):
+    def __init__(self, rotation_weight=1.0, translation_weight=10.0, quat_convention="wxyz"):
         super().__init__()
         self.rotation_weight = rotation_weight
         self.translation_weight = translation_weight
+        self.quat_convention = quat_convention
+        if self.quat_convention not in {"xyzw", "wxyz"}:
+            raise ValueError(f"Unknown quat_convention: {self.quat_convention}")
+
+    def _pred_quat_to_xyzw(self, quat):
+        quat = quat / (torch.norm(quat, dim=-1, keepdim=True) + 1e-8)
+        if self.quat_convention == "xyzw":
+            return quat
+        return torch.cat([quat[..., 1:4], quat[..., 0:1]], dim=-1)
 
     def forward(self, pose_enc_pred, pose_gt, window_pairs):
         """
@@ -92,7 +102,7 @@ class LocalRelativePoseLoss(torch.nn.Module):
         # 提取预测的 center 和 quaternion
         center_pred = pose_enc_pred[:, :, :3]  # [B, V, 3]
         quat_pred = pose_enc_pred[:, :, 3:7]   # [B, V, 4]
-        quat_pred = quat_pred / (torch.norm(quat_pred, dim=-1, keepdim=True) + 1e-8)
+        quat_pred = self._pred_quat_to_xyzw(quat_pred)
 
         # 构建 predicted pose matrix
         rot_pred = self._quaternion_to_rotation_matrix(quat_pred)
@@ -140,29 +150,8 @@ class LocalRelativePoseLoss(torch.nn.Module):
         return total_loss / num_pairs if num_pairs > 0 else 0.0
 
     def _quaternion_to_rotation_matrix(self, q):
-        """将 quaternion [B, V, 4] 转换为 rotation matrix [B, V, 3, 3]"""
-        q = q / (torch.norm(q, dim=-1, keepdim=True) + 1e-8)
-        qw, qx, qy, qz = q[:, :, 0], q[:, :, 1], q[:, :, 2], q[:, :, 3]
-
-        R00 = 1.0 - 2.0 * (qy * qy + qz * qz)
-        R01 = 2.0 * (qx * qy - qz * qw)
-        R02 = 2.0 * (qx * qz + qy * qw)
-
-        R10 = 2.0 * (qx * qy + qz * qw)
-        R11 = 1.0 - 2.0 * (qx * qx + qz * qz)
-        R12 = 2.0 * (qy * qz - qx * qw)
-
-        R20 = 2.0 * (qx * qz - qy * qw)
-        R21 = 2.0 * (qy * qz + qx * qw)
-        R22 = 1.0 - 2.0 * (qx * qx + qy * qy)
-
-        R = torch.stack([
-            torch.stack([R00, R01, R02], dim=-1),
-            torch.stack([R10, R11, R12], dim=-1),
-            torch.stack([R20, R21, R22], dim=-1),
-        ], dim=-2)
-
-        return R
+        """将 XYZW quaternion [B, V, 4] 转换为 rotation matrix [B, V, 3, 3]."""
+        return quat_to_mat(q)
 
     def _rotation_matrix_to_quaternion(self, R):
         """将 rotation matrix [B, 3, 3] 转换为 quaternion [B, 4]"""

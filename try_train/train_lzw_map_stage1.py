@@ -276,6 +276,7 @@ def save_checkpoint(model, optimizer, scheduler, scaler, iteration, loss_dict, a
             "selected_idx": list(model.selected_idx),
             "camera_trunk_depth": model.camera_trunk_depth,
             "camera_num_heads": model.camera_num_heads,
+            "pose_quat_convention": args.pose_quat_convention,
             "enable_point": False,
             "frozen_backbone": True,
             "dinov2_repo": args.dinov2_repo,
@@ -370,6 +371,12 @@ def parse_args():
     parser.add_argument("--pose_weight", type=float, default=0.1)
     parser.add_argument("--rel_pose_weight", type=float, default=0.05)
     parser.add_argument("--rel_pose_start_iter", type=int, default=500)
+    parser.add_argument(
+        "--pose_quat_convention",
+        choices=["xyzw", "wxyz"],
+        default="xyzw",
+        help="Quaternion convention for pose loss. xyzw matches official LingBot pose encoding; wxyz reproduces the legacy local loss.",
+    )
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--min_lr", type=float, default=1e-8)
     parser.add_argument("--no_geometric_aug", action="store_true")
@@ -429,6 +436,7 @@ def main():
         f"{args.rel_pose_weight:g}*rel_pose "
         f"(start={args.rel_pose_start_iter})"
     )
+    print(f"  Pose quat loss:     {args.pose_quat_convention}")
     print(f"  AMP / SDPA:         {args.use_amp} / {args.use_sdpa}")
     print(f"  Output:             {output_dir}")
     print("=" * 72)
@@ -526,8 +534,8 @@ def main():
         print(f"[resume] Continuing after iteration {start_iteration}")
 
     depth_loss_fn = DepthLoss(loss_type="masked_log_l1")
-    pose_loss_fn = PoseLoss()
-    rel_pose_loss_fn = RelativePoseLoss()
+    pose_loss_fn = PoseLoss(quat_convention=args.pose_quat_convention)
+    rel_pose_loss_fn = RelativePoseLoss(quat_convention=args.pose_quat_convention)
 
     history = {
         "iteration": [],

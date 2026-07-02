@@ -187,11 +187,18 @@ def compute_anchor_scale(
     return scale
 
 
-def apply_anchor_scale_normalization(depths, poses, scale):
+def apply_anchor_scale_normalization(
+    depths,
+    poses,
+    scale,
+    normalize_depth=True,
+    normalize_pose=True,
+):
     batch_size = depths.shape[0]
-    depths_norm = depths / scale.view(batch_size, 1, 1, 1)
+    depths_norm = depths / scale.view(batch_size, 1, 1, 1) if normalize_depth else depths
     poses_norm = poses.clone()
-    poses_norm[:, :, :3, 3] = poses[:, :, :3, 3] / scale.view(batch_size, 1, 1)
+    if normalize_pose:
+        poses_norm[:, :, :3, 3] = poses[:, :, :3, 3] / scale.view(batch_size, 1, 1)
     return depths_norm, poses_norm
 
 
@@ -445,7 +452,7 @@ def train_one_iteration(
         intrinsics = batch["intrinsics"].to(args.device, non_blocking=True)
 
     anchor_scale = None
-    if args.use_anchor_scale_norm:
+    if args.use_anchor_scale_norm or args.use_pose_anchor_scale_norm:
         anchor_scale = compute_anchor_scale(
             depths,
             valid_masks,
@@ -455,7 +462,13 @@ def train_one_iteration(
             intrinsics=intrinsics,
             sample_stride=args.anchor_scale_sample_stride,
         )
-        depths, poses = apply_anchor_scale_normalization(depths, poses, anchor_scale)
+        depths, poses = apply_anchor_scale_normalization(
+            depths,
+            poses,
+            anchor_scale,
+            normalize_depth=args.use_anchor_scale_norm,
+            normalize_pose=args.use_pose_anchor_scale_norm,
+        )
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -593,6 +606,7 @@ def save_checkpoint(model, optimizer, scheduler, scaler, iteration, loss_dict, a
             "selected_idx": list(model.selected_idx),
             "camera_trunk_depth": model.camera_trunk_depth,
             "camera_num_heads": model.camera_num_heads,
+            "pose_quat_convention": args.pose_quat_convention,
             "enable_point": False,
             "frozen_backbone": True,
             "head_only": args.head_only,
@@ -603,6 +617,8 @@ def save_checkpoint(model, optimizer, scheduler, scaler, iteration, loss_dict, a
             "enable_camera_sliding_window": model.enable_camera_sliding_window,
             "max_frame_num": args.max_frame_num,
             "anchor_scale_source": args.anchor_scale_source,
+            "use_anchor_scale_norm": args.use_anchor_scale_norm,
+            "use_pose_anchor_scale_norm": args.use_pose_anchor_scale_norm,
             "dinov2_repo": args.dinov2_repo,
             "dinov2_hub_name": args.dinov2_hub_name,
         },
@@ -667,6 +683,12 @@ def parse_args():
     parser.add_argument("--pose_weight", type=float, default=0.1)
     parser.add_argument("--rel_pose_weight", type=float, default=0.05)
     parser.add_argument("--rel_pose_start_iter", type=int, default=500)
+    parser.add_argument(
+        "--pose_quat_convention",
+        choices=["xyzw", "wxyz"],
+        default="xyzw",
+        help="Quaternion convention for pose loss. xyzw matches official LingBot pose encoding; wxyz reproduces the legacy local loss.",
+    )
 
     parser.add_argument("--views_start", type=int, default=4)
     parser.add_argument("--views_end", type=int, default=8)
@@ -678,6 +700,8 @@ def parse_args():
 
     parser.add_argument("--use_anchor_scale_norm", action="store_true", default=True)
     parser.add_argument("--no_anchor_scale_norm", dest="use_anchor_scale_norm", action="store_false")
+    parser.add_argument("--use_pose_anchor_scale_norm", action="store_true", default=True)
+    parser.add_argument("--no_pose_anchor_scale_norm", dest="use_pose_anchor_scale_norm", action="store_false")
     parser.add_argument(
         "--anchor_scale_source",
         choices=["pointcloud_mean", "depth_median", "translation_norm"],
@@ -750,9 +774,14 @@ def main():
     print(f"  Anchor frames:      {args.num_frame_for_scale}")
     print(f"  LR / WD:            {args.lr:g} / {args.weight_decay:g}")
     print(
-        f"  Anchor norm:        {args.use_anchor_scale_norm} "
+        f"  Depth anchor norm:  {args.use_anchor_scale_norm} "
         f"({args.anchor_scale_source}, stride={args.anchor_scale_sample_stride})"
     )
+    print(
+        f"  Pose anchor norm:   {args.use_pose_anchor_scale_norm} "
+        f"({args.anchor_scale_source}, stride={args.anchor_scale_sample_stride})"
+    )
+    print(f"  Pose quat loss:     {args.pose_quat_convention}")
     print(f"  AMP / SDPA:         {args.use_amp} / {args.use_sdpa}")
     print(f"  Output:             {output_dir}")
     if args.resume:
@@ -861,8 +890,8 @@ def main():
         print(f"[resume] Continuing after iteration {start_iteration}")
 
     depth_loss_fn = DepthLoss(loss_type="masked_log_l1")
-    pose_loss_fn = PoseLoss()
-    rel_pose_loss_fn = LocalRelativePoseLoss()
+    pose_loss_fn = PoseLoss(quat_convention=args.pose_quat_convention)
+    rel_pose_loss_fn = LocalRelativePoseLoss(quat_convention=args.pose_quat_convention)
 
     history = {
         "iteration": [],
