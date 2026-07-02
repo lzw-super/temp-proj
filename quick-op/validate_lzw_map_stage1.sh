@@ -15,7 +15,9 @@
 #   - NUM_VIS 只控制输出图片里可视化多少个 sample，不影响指标统计。
 #   - ORIGINAL_MODEL 用于和原始 LingBot-Map 做对比；只看 LZW 自身时也仍需传入脚本。
 #   - Stage1 validation 固定使用 temporal_nearby、无数据增强、max_dim=518。
-#   - NUM_VIEWS < 3 时 Sim(3) ATE 不稳定/退化，位姿更建议看 Official XYZW RPE 指标。
+#   - 位姿指标会输出 Official XYZW AUC@3/5/15/30、Racc/Tacc、Sim(3) ATE 和 RPE；
+#     AUC 越高越好，ATE/RPE 越低越好。
+#   - NUM_VIEWS < 3 时 Sim(3) ATE 和 pairwise AUC 统计都较弱，位姿更建议看 Official XYZW RPE 指标。
 
 set -e
 
@@ -40,6 +42,7 @@ echo "  Samples:       ${NUM_SAMPLES}"
 echo "  Views:         ${NUM_VIEWS}"
 echo "  Visual samples:${NUM_VIS}"
 echo "  Output:        ${OUTPUT_DIR}"
+echo "  Pose metrics:  AUC@3/5/15/30, ATE, RPE (Official XYZW)"
 echo "========================================================================"
 
 conda run -n lingbot-map --no-capture-output python try_train/validate_lzw_map_stage1.py \

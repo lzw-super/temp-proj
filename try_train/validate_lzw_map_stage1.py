@@ -28,6 +28,9 @@ from train_lzw_map_stage1 import (
 )
 
 
+POSE_AUC_THRESHOLDS = (3, 5, 15, 30)
+
+
 def autocast_context(device):
     if str(device).startswith("cuda") and torch.cuda.is_available():
         return torch.amp.autocast("cuda", dtype=torch.float16)
@@ -152,6 +155,75 @@ def sim3_align_centers(pred_center, gt_center):
     return aligned, torch.stack(scales), torch.stack(rotations)
 
 
+def invert_transform(transform):
+    inv = torch.empty_like(transform)
+    rot = transform[..., :3, :3]
+    trans = transform[..., :3, 3]
+    rot_t = rot.transpose(-1, -2)
+    inv[..., :3, :3] = rot_t
+    inv[..., :3, 3] = -(rot_t @ trans.unsqueeze(-1)).squeeze(-1)
+    inv[..., 3, :3] = 0
+    inv[..., 3, 3] = 1
+    return inv
+
+
+def build_pose_matrix(rotation, translation):
+    pose = torch.zeros(
+        rotation.shape[:-2] + (4, 4),
+        device=rotation.device,
+        dtype=rotation.dtype,
+    )
+    pose[..., :3, :3] = rotation
+    pose[..., :3, 3] = translation
+    pose[..., 3, 3] = 1
+    return pose
+
+
+def align_to_first_camera(extrinsics):
+    first_inv = invert_transform(extrinsics[:, :1])
+    return extrinsics @ first_inv
+
+
+def translation_angle_deg(trans_pred, trans_gt):
+    pred_norm = torch.norm(trans_pred, dim=-1, keepdim=True)
+    gt_norm = torch.norm(trans_gt, dim=-1, keepdim=True)
+    pred_unit = trans_pred / pred_norm.clamp(min=1e-15)
+    gt_unit = trans_gt / gt_norm.clamp(min=1e-15)
+    cos_angle = (pred_unit * gt_unit).sum(dim=-1).abs().clamp(min=-1.0, max=1.0)
+    angle = torch.acos(cos_angle) * (180.0 / np.pi)
+    invalid = (pred_norm.squeeze(-1) <= 1e-15) | (gt_norm.squeeze(-1) <= 1e-15)
+    return torch.where(invalid, torch.full_like(angle, 90.0), angle)
+
+
+def calculate_pose_auc(rot_error, trans_error, thresholds=POSE_AUC_THRESHOLDS):
+    valid = torch.isfinite(rot_error) & torch.isfinite(trans_error)
+    metrics = {}
+    if not valid.any():
+        for threshold in thresholds:
+            metrics.update({
+                f"auc{threshold}": float("nan"),
+                f"racc{threshold}": float("nan"),
+                f"tacc{threshold}": float("nan"),
+            })
+        return metrics
+
+    rot_error_np = rot_error[valid].detach().cpu().numpy()
+    trans_error_np = trans_error[valid].detach().cpu().numpy()
+    max_errors = np.maximum(rot_error_np, trans_error_np)
+    num_pairs = float(len(max_errors))
+
+    for threshold in thresholds:
+        bins = np.arange(threshold + 1)
+        histogram, _ = np.histogram(max_errors, bins=bins)
+        auc = float(np.mean(np.cumsum(histogram.astype(float) / num_pairs)) * 100.0)
+        metrics.update({
+            f"auc{threshold}": auc,
+            f"racc{threshold}": float(np.mean(rot_error_np < threshold) * 100.0),
+            f"tacc{threshold}": float(np.mean(trans_error_np < threshold) * 100.0),
+        })
+    return metrics
+
+
 def compute_scale_anchor_info(pose_enc, pose_gt):
     pred_center = pose_enc[:, :, :3].float()
     gt_center = pose_gt[:, :, :3, 3].float()
@@ -222,6 +294,12 @@ def compute_pose_metrics_for_convention(pose_enc, pose_gt, convention, sim3_scal
             f"{prefix}_rpe_trans_dir_mean_deg": float("nan"),
             f"{prefix}_rpe_center_dist_rmse_m": float("nan"),
         })
+        for threshold in POSE_AUC_THRESHOLDS:
+            metrics.update({
+                f"{prefix}_auc{threshold}": float("nan"),
+                f"{prefix}_racc{threshold}": float("nan"),
+                f"{prefix}_tacc{threshold}": float("nan"),
+            })
         return metrics
 
     pair_i, pair_j = torch.triu_indices(num_views, num_views, offset=1, device=center_pred.device)
@@ -266,6 +344,23 @@ def compute_pose_metrics_for_convention(pose_enc, pose_gt, convention, sim3_scal
         f"{prefix}_rpe_trans_mean_m": tensor_mean(rel_trans_error),
         f"{prefix}_rpe_trans_dir_mean_deg": dir_mean,
         f"{prefix}_rpe_center_dist_rmse_m": tensor_rmse(pair_distance_error),
+    })
+
+    # LingBot benchmark-style pairwise relative-pose AUC: C2W poses are
+    # converted to W2C, aligned to the first camera, then evaluated by angular
+    # rotation and translation-direction errors over all unordered pairs.
+    c2w_pred = build_pose_matrix(rot_pred, center_pred)
+    c2w_gt = build_pose_matrix(rot_gt, center_gt)
+    pred_extrinsics = align_to_first_camera(invert_transform(c2w_pred))
+    gt_extrinsics = align_to_first_camera(invert_transform(c2w_gt))
+    rel_pose_pred = invert_transform(pred_extrinsics[:, pair_i]) @ pred_extrinsics[:, pair_j]
+    rel_pose_gt = invert_transform(gt_extrinsics[:, pair_i]) @ gt_extrinsics[:, pair_j]
+    auc_rot_deg = rotation_angle_rad(rel_pose_pred[..., :3, :3], rel_pose_gt[..., :3, :3]) * (180.0 / np.pi)
+    auc_trans_deg = translation_angle_deg(rel_pose_pred[..., :3, 3], rel_pose_gt[..., :3, 3])
+    auc_metrics = calculate_pose_auc(auc_rot_deg.reshape(-1), auc_trans_deg.reshape(-1))
+    metrics.update({
+        f"{prefix}_{metric_name}": metric_value
+        for metric_name, metric_value in auc_metrics.items()
     })
     return metrics
 
@@ -421,6 +516,8 @@ def evaluate_model(model, model_kind, dataset, data_root, device, num_samples, n
             f"  [{label} {sample_idx + 1}/{min(num_samples, len(dataset))}] "
             f"depth={float(metric_depth_loss):.4f} "
             f"depth_aligned={float(aligned_depth_loss):.4f} "
+            f"auc3={pose_metrics['pose_xyzw_auc3']:.2f} "
+            f"auc30={pose_metrics['pose_xyzw_auc30']:.2f} "
             f"ate={pose_metrics['pose_ate_sim3_rmse_m']:.4f}m "
             f"xyzw_rpeR={pose_metrics['pose_xyzw_rpe_rot_mean_deg']:.2f}deg "
             f"xyzw_rpeT={pose_metrics['pose_xyzw_rpe_trans_rmse_m']:.4f}m "
@@ -515,23 +612,27 @@ def plot_metrics(results, output_path):
 
 def plot_pose_metrics(results, output_path):
     metrics = [
+        "pose_xyzw_auc3",
+        "pose_xyzw_auc30",
         "pose_ate_sim3_rmse_m",
+        "pose_xyzw_rpe_trans_rmse_m",
         "pose_xyzw_anchor_rot_mean_deg",
         "pose_xyzw_rpe_rot_mean_deg",
-        "pose_xyzw_rpe_trans_rmse_m",
         "pose_wxyz_anchor_rot_mean_deg",
         "pose_wxyz_rpe_rot_mean_deg",
     ]
     titles = [
+        "Official XYZW AUC@3 (%)",
+        "Official XYZW AUC@30 (%)",
         "Sim(3) ATE RMSE (m)",
+        "Official XYZW RPE Trans RMSE (m)",
         "Official XYZW Anchored Rot (deg)",
         "Official XYZW RPE Rot (deg)",
-        "Official XYZW RPE Trans RMSE (m)",
         "Legacy WXYZ Anchored Rot (deg)",
         "Legacy WXYZ RPE Rot (deg)",
     ]
     names = list(results)
-    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
+    fig, axes = plt.subplots(2, 4, figsize=(22, 9))
     colors = ["#3478bf", "#d68c2f", "#3f995b"]
     for axis, metric, title in zip(axes.flat, metrics, titles):
         values = [results[name].get(metric, float("nan")) for name in names]
@@ -765,6 +866,11 @@ def main():
                 "ate": "Umeyama Sim(3) alignment of predicted camera centers to GT centers",
                 "rpe_translation": "relative translation scaled by Sim(3) scale",
                 "legacy_loss": "first-frame anchor plus one positive translation scale per sample",
+                "auc": (
+                    "pairwise relative-pose AUC@{3,5,15,30} in percent; C2W poses are converted "
+                    "to W2C, aligned to the first camera, then scored by max(rotation angular error, "
+                    "translation-direction angular error)"
+                ),
             },
             "pose_quaternion_conventions": {
                 "xyzw": "official LingBot pose encoding, scalar-last",
@@ -796,40 +902,47 @@ def main():
     save_pose_outputs(predictions, frame_ids, output_dir / "pose_outputs_sample0.json")
     save_pose_metrics(predictions, output_dir / "pose_metrics_per_sample.json")
 
-    print("\n" + "-" * 78)
+    print("\n" + "-" * 102)
     print(
         f"{'Model':<20} {'Depth':>10} {'DepthA':>10} "
-        f"{'ATE(m)':>10} {'XYZW RPE-R':>12} {'XYZW RPE-T':>12}"
+        f"{'AUC@3':>9} {'AUC@30':>9} {'ATE(m)':>10} "
+        f"{'XYZW RPE-R':>12} {'XYZW RPE-T':>12}"
     )
-    print("-" * 78)
+    print("-" * 102)
     for name, metrics in results.items():
         print(
             f"{name:<20} "
             f"{metrics['metric_depth_loss']:>10.5f} "
             f"{metrics['scale_aligned_depth_loss']:>10.5f} "
+            f"{metrics['pose_xyzw_auc3']:>9.2f} "
+            f"{metrics['pose_xyzw_auc30']:>9.2f} "
             f"{metrics['pose_ate_sim3_rmse_m']:>10.5f} "
             f"{metrics['pose_xyzw_rpe_rot_mean_deg']:>12.4f} "
             f"{metrics['pose_xyzw_rpe_trans_rmse_m']:>12.5f}"
         )
-    print("-" * 78)
+    print("-" * 102)
 
-    print("\nOfficial XYZW pose metrics (lower is better)")
-    print("-" * 92)
+    print("\nOfficial XYZW pose metrics (AUC higher is better; errors lower are better)")
+    print("-" * 112)
     print(
-        f"{'Model':<20} {'AbsRot':>10} {'AnchRot':>10} "
-        f"{'RPERot':>10} {'RPETrans':>10} {'Sim3Scale':>10}"
+        f"{'Model':<20} {'AUC@3':>9} {'AUC@5':>9} {'AUC@15':>9} {'AUC@30':>9} "
+        f"{'AbsRot':>10} {'AnchRot':>10} {'RPERot':>10} {'RPETrans':>10} {'Sim3Scale':>10}"
     )
-    print("-" * 92)
+    print("-" * 112)
     for name, metrics in results.items():
         print(
             f"{name:<20} "
+            f"{metrics['pose_xyzw_auc3']:>9.2f} "
+            f"{metrics['pose_xyzw_auc5']:>9.2f} "
+            f"{metrics['pose_xyzw_auc15']:>9.2f} "
+            f"{metrics['pose_xyzw_auc30']:>9.2f} "
             f"{metrics['pose_xyzw_abs_rot_mean_deg']:>10.4f} "
             f"{metrics['pose_xyzw_anchor_rot_mean_deg']:>10.4f} "
             f"{metrics['pose_xyzw_rpe_rot_mean_deg']:>10.4f} "
             f"{metrics['pose_xyzw_rpe_trans_rmse_m']:>10.5f} "
             f"{metrics['pose_sim3_scale']:>10.4f}"
         )
-    print("-" * 92)
+    print("-" * 112)
 
     print("\nLegacy WXYZ diagnostics (matches the old local PoseLoss convention)")
     print("-" * 92)

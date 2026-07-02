@@ -7,6 +7,18 @@
 #   bash quick-op/train_lzw_map_stage2.sh 5000 path/to/stage1_checkpoint.pt
 #   RESUME=auto bash quick-op/train_lzw_map_stage2.sh 5000
 #
+# Resume examples:
+#   # 自动从当前 OUTPUT_DIR 中选择最新 checkpoint_iter_*.pt 续训；参数要和原训练保持一致。
+#   RESUME=auto bash quick-op/train_lzw_map_stage2.sh 5000 \
+#     try_train/checkpoints/lzw_map_stage1_frozen_dinov2_2-20_spatial_nearby_5000iters/checkpoint_final.pt \
+#     15 20 4 8 1e-4 0.1 0.05 500
+#
+#   # 或者显式指定断点；TOTAL_ITERS 是最终总步数，不是追加步数。
+#   RESUME=try_train/checkpoints/lzw_map_stage2_full_15-20_k4-8_5000iters/checkpoint_iter_3000.pt \
+#     bash quick-op/train_lzw_map_stage2.sh 5000 \
+#     try_train/checkpoints/lzw_map_stage1_frozen_dinov2_2-20_spatial_nearby_5000iters/checkpoint_final.pt \
+#     15 20 4 8 1e-4 0.1 0.05 500
+#
 # Environment variables:
 #   DINOV2_REPO  可改：local original DINOv2 repository path
 #   STAGE1_CKPT  可改：optional Stage1 LZW-Map checkpoint path

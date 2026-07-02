@@ -202,6 +202,8 @@ def evaluate_model(
             f"  [{label} {sample_idx + 1}/{sample_count}] "
             f"depth={float(metric_depth_loss):.4f} "
             f"depth_aligned={float(aligned_depth_loss):.4f} "
+            f"auc3={pose_metrics['pose_xyzw_auc3']:.2f} "
+            f"auc30={pose_metrics['pose_xyzw_auc30']:.2f} "
             f"ate={pose_metrics['pose_ate_sim3_rmse_m']:.4f}m "
             f"xyzw_rpeR={pose_metrics['pose_xyzw_rpe_rot_mean_deg']:.2f}deg "
             f"xyzw_rpeT={pose_metrics['pose_xyzw_rpe_trans_rmse_m']:.4f}m"
@@ -433,6 +435,15 @@ def main():
             "stage2_num_frame_for_scale": args.stage2_num_frame_for_scale,
             "stage2_forward": "strict GCA streaming",
             "depth_alignment": "per-view GT median scale",
+            "pose_alignment": {
+                "ate": "Umeyama Sim(3) alignment of predicted camera centers to GT centers",
+                "auc": (
+                    "pairwise relative-pose AUC@{3,5,15,30} in percent; C2W poses are converted "
+                    "to W2C, aligned to the first camera, then scored by max(rotation angular error, "
+                    "translation-direction angular error)"
+                ),
+                "rpe": "relative pose error over all unordered pairs in the sampled validation clip",
+            },
             "pose_quaternion_conventions": {
                 "xyzw": "official LingBot pose encoding, scalar-last",
                 "wxyz": "legacy local training-loss interpretation, scalar-first",
@@ -463,22 +474,47 @@ def main():
     save_pose_outputs(predictions, frame_ids, output_dir / "pose_outputs_sample0.json")
     save_pose_metrics(predictions, output_dir / "pose_metrics_per_sample.json")
 
-    print("\n" + "-" * 78)
+    print("\n" + "-" * 104)
     print(
         f"{'Model':<22} {'Depth':>10} {'DepthA':>10} "
-        f"{'ATE(m)':>10} {'XYZW RPE-R':>12} {'XYZW RPE-T':>12}"
+        f"{'AUC@3':>9} {'AUC@30':>9} {'ATE(m)':>10} "
+        f"{'XYZW RPE-R':>12} {'XYZW RPE-T':>12}"
     )
-    print("-" * 78)
+    print("-" * 104)
     for name, metrics in results.items():
         print(
             f"{name:<22} "
             f"{metrics['metric_depth_loss']:>10.5f} "
             f"{metrics['scale_aligned_depth_loss']:>10.5f} "
+            f"{metrics['pose_xyzw_auc3']:>9.2f} "
+            f"{metrics['pose_xyzw_auc30']:>9.2f} "
             f"{metrics['pose_ate_sim3_rmse_m']:>10.5f} "
             f"{metrics['pose_xyzw_rpe_rot_mean_deg']:>12.4f} "
             f"{metrics['pose_xyzw_rpe_trans_rmse_m']:>12.5f}"
         )
-    print("-" * 78)
+    print("-" * 104)
+
+    print("\nOfficial XYZW pose metrics (AUC higher is better; errors lower are better)")
+    print("-" * 114)
+    print(
+        f"{'Model':<22} {'AUC@3':>9} {'AUC@5':>9} {'AUC@15':>9} {'AUC@30':>9} "
+        f"{'AbsRot':>10} {'AnchRot':>10} {'RPERot':>10} {'RPETrans':>10} {'Sim3Scale':>10}"
+    )
+    print("-" * 114)
+    for name, metrics in results.items():
+        print(
+            f"{name:<22} "
+            f"{metrics['pose_xyzw_auc3']:>9.2f} "
+            f"{metrics['pose_xyzw_auc5']:>9.2f} "
+            f"{metrics['pose_xyzw_auc15']:>9.2f} "
+            f"{metrics['pose_xyzw_auc30']:>9.2f} "
+            f"{metrics['pose_xyzw_abs_rot_mean_deg']:>10.4f} "
+            f"{metrics['pose_xyzw_anchor_rot_mean_deg']:>10.4f} "
+            f"{metrics['pose_xyzw_rpe_rot_mean_deg']:>10.4f} "
+            f"{metrics['pose_xyzw_rpe_trans_rmse_m']:>10.5f} "
+            f"{metrics['pose_sim3_scale']:>10.4f}"
+        )
+    print("-" * 114)
 
     initial = results["LZW Stage2 Init"]
     trained = results["LZW Stage2 Trained"]

@@ -6,6 +6,11 @@
 #   bash quick-op/train_lzw_map_stage1.sh 200
 #   bash quick-op/train_lzw_map_stage1.sh 5000 2 4 spatial_nearby 2e-4 0.1 0.05 500
 #
+# Resume example:
+#   # 断点续训到总步数 5000；注意参数要和原训练保持一致，TOTAL_ITERS 是最终总步数，不是追加步数。
+#   RESUME=try_train/checkpoints/lzw_map_stage1_frozen_dinov2_2-20_spatial_nearby_5000iters/checkpoint_iter_3000.pt \
+#     bash quick-op/train_lzw_map_stage1.sh 5000 2 20 spatial_nearby 2e-4 0.1 0.05 500
+#
 # Environment variables:
 #   DINOV2_REPO  可改：local original DINOv2 repository path
 #   RESUME       可改：optional LZW-Map checkpoint path

@@ -28,6 +28,8 @@
 #   - Python 入口还支持 --max_frame_num，当前 quick 脚本未暴露，默认 400；
 #     如果 NUM_VIEWS > 400，需要同步扩展脚本传入更大的 --max_frame_num。
 #   - Stage2 validation 固定使用 temporal_nearby、无数据增强、max_dim=518。
+#   - 位姿指标会输出 Official XYZW AUC@3/5/15/30、Racc/Tacc、Sim(3) ATE 和 RPE；
+#     AUC 越高越好，ATE/RPE 越低越好。
 
 set -e
 
@@ -63,6 +65,7 @@ echo "  GCA window k:   ${STAGE2_K}"
 echo "  Anchor frames:  ${ANCHOR_FRAMES}"
 echo "  Visual samples: ${NUM_VIS}"
 echo "  Output:         ${OUTPUT_DIR}"
+echo "  Pose metrics:   AUC@3/5/15/30, ATE, RPE (Official XYZW)"
 echo "========================================================================"
 
 conda run -n lingbot-map --no-capture-output python try_train/validate_lzw_map_stage2.py \
